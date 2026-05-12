@@ -46,14 +46,28 @@ class Rect(BaseModel):
 
 class ProcessOptions(BaseModel):
     threshold: int = Field(default=180, ge=0, le=255)
-    dilate_iter: int = Field(default=2, ge=0, le=8)
-    inpaint_radius: int = Field(default=3, ge=1, le=20)
+    dilate_iter: int | None = Field(default=None, ge=0, le=8)
+    inpaint_radius: int | None = Field(default=None, ge=1, le=20)
     method: Literal["TELEA", "NS"] = "TELEA"
+    inpaint_strength: Literal["low", "medium", "high"] = "medium"
+    mask_dilate: int | None = Field(default=None, ge=0, le=30)
+    feather_radius: int = Field(default=6, ge=0, le=20)
+    keep_audio: bool = True
 
 
 class ProcessRequest(BaseModel):
     video_id: str
-    rect: Rect
+    rect: Rect | None = None
+    x: int | None = Field(default=None, ge=0)
+    y: int | None = Field(default=None, ge=0)
+    width: int | None = Field(default=None, gt=0)
+    height: int | None = Field(default=None, gt=0)
+    video_width: int | None = Field(default=None, gt=0)
+    video_height: int | None = Field(default=None, gt=0)
+    inpaint_strength: Literal["low", "medium", "high"] | None = None
+    mask_dilate: int | None = Field(default=None, ge=0, le=30)
+    feather_radius: int | None = Field(default=None, ge=0, le=20)
+    keep_audio: bool | None = None
     options: ProcessOptions = Field(default_factory=ProcessOptions)
 
 
@@ -93,8 +107,12 @@ async def upload_video(request: Request, file: UploadFile = File(...)) -> dict:
     return {
         "video_id": saved["video_id"],
         "filename": saved["filename"],
+        "size": saved["size"],
+        "extension": saved["extension"],
         "width": video_info["width"],
         "height": video_info["height"],
+        "video_width": video_info["width"],
+        "video_height": video_info["height"],
         "duration": video_info["duration"],
         "fps": video_info["fps"],
     }
@@ -116,18 +134,25 @@ def process(request: ProcessRequest, background_tasks: BackgroundTasks) -> dict:
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail="Video not found") from exc
 
-    if request.rect.x >= metadata["width"] or request.rect.y >= metadata["height"]:
+    rect = resolve_process_rect(request)
+    if rect.x >= metadata["width"] or rect.y >= metadata["height"]:
         raise HTTPException(status_code=400, detail="Rect is outside video bounds")
 
-    job = jobs.create_job("任务已提交")
+    options = request.options.model_dump()
+    for field_name in ("inpaint_strength", "mask_dilate", "feather_radius", "keep_audio"):
+        value = getattr(request, field_name)
+        if value is not None:
+            options[field_name] = value
+
+    job = jobs.create_job("视频已上传，等待读取", status="uploaded")
     background_tasks.add_task(
         process_video,
         job_id=job.job_id,
         video_id=request.video_id,
-        rect=request.rect.model_dump(),
-        options=request.options.model_dump(),
+        rect=rect.model_dump(),
+        options=options,
     )
-    return {"job_id": job.job_id, "status": "processing"}
+    return {"job_id": job.job_id, "status": job.status}
 
 
 @app.get("/api/progress/{job_id}")
@@ -144,6 +169,20 @@ def progress(job_id: str) -> dict:
     }
 
 
+@app.post("/api/cancel/{job_id}")
+def cancel(job_id: str) -> dict:
+    try:
+        job = jobs.get_job(job_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Job not found") from exc
+
+    if job["status"] in {"completed", "done", "failed", "canceled"}:
+        return job
+
+    jobs.update_job(job_id, status="canceled", message="任务已取消")
+    return jobs.get_job(job_id)
+
+
 @app.get("/api/download/{job_id}")
 def download(job_id: str) -> FileResponse:
     try:
@@ -151,7 +190,7 @@ def download(job_id: str) -> FileResponse:
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Job not found") from exc
 
-    if job["status"] != "done":
+    if job["status"] not in {"completed", "done"}:
         raise HTTPException(status_code=409, detail="Job is not complete")
 
     path = storage.output_path(job_id)
@@ -161,7 +200,22 @@ def download(job_id: str) -> FileResponse:
     return FileResponse(
         path,
         media_type="video/mp4",
-        filename=f"subtitle-removed-{job_id}.mp4",
+        filename=f"subtitle_removed_{job_id}.mp4",
+    )
+
+
+def resolve_process_rect(request: ProcessRequest) -> Rect:
+    if request.rect is not None:
+        return request.rect
+
+    if None in (request.x, request.y, request.width, request.height):
+        raise HTTPException(status_code=400, detail="Rect coordinates are required")
+
+    return Rect(
+        x=int(request.x),
+        y=int(request.y),
+        width=int(request.width),
+        height=int(request.height),
     )
 
 

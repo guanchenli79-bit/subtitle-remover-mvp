@@ -18,11 +18,11 @@ _jobs: dict[str, JobState] = {}
 _lock = Lock()
 
 
-def create_job(message: str = "Waiting to start") -> JobState:
+def create_job(message: str = "Waiting to start", status: str = "uploaded") -> JobState:
     job_id = uuid4().hex
     job = JobState(
         job_id=job_id,
-        status="processing",
+        status=status,
         progress=0.0,
         message=message,
     )
@@ -41,6 +41,8 @@ def update_job(
 ) -> None:
     with _lock:
         job = _jobs[job_id]
+        if job.status == "canceled" and status != "canceled":
+            return
         if status is not None:
             job.status = status
         if progress is not None:

@@ -1,49 +1,88 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { ProcessingPanel, type ProcessOptions, type ProgressState } from "../components/ProcessingPanel";
-import { VideoAnnotator, type OriginalRect } from "../components/VideoAnnotator";
+import { VideoAnnotator, type SelectionState, type VideoMetadata } from "../components/VideoAnnotator";
 import { VideoUploader, type UploadedVideo } from "../components/VideoUploader";
 
 const RAW_API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? "";
 const API_BASE_URL = RAW_API_BASE_URL.replace(/\/+$/, "");
 
+const STRENGTH_TO_RADIUS: Record<ProcessOptions["inpaint_strength"], number> = {
+  low: 2,
+  medium: 3,
+  high: 5
+};
+
 export default function Home() {
   const [video, setVideo] = useState<UploadedVideo | null>(null);
-  const [rect, setRect] = useState<OriginalRect | null>(null);
+  const [selection, setSelection] = useState<SelectionState | null>(null);
   const [jobId, setJobId] = useState<string | null>(null);
   const [progress, setProgress] = useState<ProgressState | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const videoUrl = useMemo(() => {
-    if (!video) {
-      return null;
-    }
-    return `${API_BASE_URL}/api/video/${video.video_id}`;
-  }, [video]);
+  useEffect(() => {
+    return () => {
+      if (video?.preview_url) {
+        URL.revokeObjectURL(video.preview_url);
+      }
+    };
+  }, [video?.preview_url]);
 
-  const downloadUrl = useMemo(() => {
-    if (progress?.status !== "done" || !progress.download_url) {
+  const outputUrl = useMemo(() => {
+    if (!progress?.download_url || !["completed", "done"].includes(progress.status)) {
       return null;
     }
     return `${API_BASE_URL}${progress.download_url}`;
   }, [progress]);
 
   function handleUploaded(uploaded: UploadedVideo) {
-    setVideo(uploaded);
-    setRect(null);
+    setVideo((current) => {
+      if (current?.preview_url) {
+        URL.revokeObjectURL(current.preview_url);
+      }
+      return uploaded;
+    });
+    setSelection(null);
     setJobId(null);
-    setProgress(null);
+    setProgress({ status: "uploaded", progress: 0.05, message: "视频已上传，正在读取本地预览", download_url: null });
     setError(null);
   }
 
+  function handleVideoMetadata(metadata: VideoMetadata) {
+    setVideo((current) => {
+      if (!current) {
+        return current;
+      }
+      return {
+        ...current,
+        width: metadata.width || current.width,
+        height: metadata.height || current.height,
+        duration: metadata.duration || current.duration
+      };
+    });
+  }
+
+  function handleCancel() {
+    setJobId(null);
+    setProgress((current) =>
+      current && !["completed", "done", "canceled", "failed"].includes(current.status)
+        ? { ...current, status: "canceled", message: "正在取消任务" }
+        : current
+    );
+    if (jobId) {
+      fetch(`${API_BASE_URL}/api/cancel/${jobId}`, { method: "POST" }).catch(() => undefined);
+    }
+  }
+
   async function startProcessing(options: ProcessOptions) {
-    if (!video || !rect) {
+    if (!video || !selection) {
       return;
     }
 
+    const rect = selection.videoRect;
     setError(null);
-    setProgress({ status: "processing", progress: 0, message: "提交任务中", download_url: null });
+    setProgress({ status: "uploaded", progress: 0.08, message: "任务已提交", download_url: null });
 
     const response = await fetch(`${API_BASE_URL}/api/process`, {
       method: "POST",
@@ -53,7 +92,23 @@ export default function Home() {
       body: JSON.stringify({
         video_id: video.video_id,
         rect,
-        options
+        x: rect.x,
+        y: rect.y,
+        width: rect.width,
+        height: rect.height,
+        video_width: video.width,
+        video_height: video.height,
+        inpaint_strength: options.inpaint_strength,
+        mask_dilate: options.mask_dilate,
+        feather_radius: options.feather_radius,
+        keep_audio: options.keep_audio,
+        options: {
+          inpaint_strength: options.inpaint_strength,
+          mask_dilate: options.mask_dilate,
+          feather_radius: options.feather_radius,
+          keep_audio: options.keep_audio,
+          inpaint_radius: STRENGTH_TO_RADIUS[options.inpaint_strength]
+        }
       })
     });
 
@@ -62,74 +117,71 @@ export default function Home() {
       throw new Error(payload?.detail ?? "处理任务提交失败");
     }
 
-    const payload = (await response.json()) as { job_id: string; status: string };
+    const payload = (await response.json()) as { job_id: string; status: ProgressState["status"] };
     setJobId(payload.job_id);
+    setProgress({
+      status: payload.status ?? "uploaded",
+      progress: 0.1,
+      message: "后端已接收处理任务",
+      download_url: null
+    });
   }
 
   return (
     <main className="app-shell">
       <header className="app-header">
         <div className="brand">
-          <div className="brand-mark">▶</div>
+          <div className="brand-mark">SR</div>
           <div>
-            <strong>字幕净化</strong>
-            <span>智能去字幕工具</span>
+            <strong>Subtitle Remover</strong>
+            <span>视频去字幕处理台</span>
           </div>
         </div>
-
-        <nav className="main-nav" aria-label="主导航">
-          <a href="#">首页</a>
-          <a href="#">功能</a>
-          <a href="#">使用说明</a>
-          <a className="active" href="#">控制台</a>
-        </nav>
-
-        <div className="header-actions">
-          <button type="button" aria-label="切换主题">☼</button>
-          <span>本地模式</span>
+        <div className="header-status">
+          <span>{video ? `${video.width} x ${video.height}` : "等待上传"}</span>
+          <strong>{selection ? "已选择字幕区域" : "未选择区域"}</strong>
         </div>
       </header>
 
-      <div className="console-grid">
+      <div className="workspace-grid">
         <section className="left-column">
-          {video && videoUrl ? (
+          {video ? (
             <VideoAnnotator
               key={video.video_id}
               video={video}
-              videoUrl={videoUrl}
-              outputUrl={downloadUrl}
-              rect={rect}
-              onRectChange={setRect}
+              videoUrl={video.preview_url}
+              outputUrl={outputUrl}
+              selection={selection}
+              onSelectionChange={setSelection}
+              onVideoMetadata={handleVideoMetadata}
             />
           ) : (
-            <div className="preview-card empty-preview">
+            <section className="viewer-panel empty-viewer">
               <div>
-                <h1>视频去字幕工具</h1>
-                <p>上传视频后，在画面上拖动鼠标框选字幕所在区域。</p>
+                <span className="eyebrow">Preview</span>
+                <h1>上传视频后开始处理</h1>
+                <p>左侧会显示本地 HTML5 视频预览，可播放、暂停、拖动时间轴并框选字幕区域。</p>
               </div>
-            </div>
+            </section>
           )}
         </section>
 
-        <aside className="right-column">
+        <section className="right-column">
           <VideoUploader apiBaseUrl={API_BASE_URL} video={video} onUploaded={handleUploaded} />
-
           <ProcessingPanel
             apiBaseUrl={API_BASE_URL}
-            hasVideo={Boolean(video)}
-            canProcess={Boolean(video && rect)}
+            video={video}
+            selection={selection}
             jobId={jobId}
-            rect={rect}
             progress={progress}
             onProgress={setProgress}
-            onResetRect={() => setRect(null)}
+            onResetSelection={() => setSelection(null)}
             onStart={startProcessing}
+            onCancel={handleCancel}
             onError={setError}
           />
-        </aside>
+        </section>
       </div>
-
-      <p className="copyright-tip">请只处理自己拥有版权或有授权的视频。</p>
 
       {error ? <div className="toast error">{error}</div> : null}
     </main>

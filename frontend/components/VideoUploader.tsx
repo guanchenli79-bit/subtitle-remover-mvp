@@ -9,6 +9,14 @@ export type UploadedVideo = {
   height: number;
   duration: number;
   fps: number;
+  size: number;
+  preview_url: string;
+};
+
+type UploadResponse = Omit<UploadedVideo, "preview_url" | "size"> & {
+  size?: number;
+  video_width?: number;
+  video_height?: number;
 };
 
 type Props = {
@@ -20,6 +28,7 @@ type Props = {
 export function VideoUploader({ apiBaseUrl, video, onUploaded }: Props) {
   const inputRef = useRef<HTMLInputElement | null>(null);
   const [selectedName, setSelectedName] = useState<string>("未选择文件");
+  const [selectedSize, setSelectedSize] = useState<number | null>(null);
   const [isUploading, setIsUploading] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
 
@@ -30,6 +39,7 @@ export function VideoUploader({ apiBaseUrl, video, onUploaded }: Props) {
     }
 
     setSelectedName(file.name);
+    setSelectedSize(file.size);
     setMessage(null);
   }
 
@@ -56,9 +66,16 @@ export function VideoUploader({ apiBaseUrl, video, onUploaded }: Props) {
         throw new Error(payload?.detail ?? "上传失败");
       }
 
-      const uploaded = (await response.json()) as UploadedVideo;
-      onUploaded(uploaded);
-      setMessage(`${uploaded.width} × ${uploaded.height} · ${uploaded.fps} fps`);
+      const uploaded = (await response.json()) as UploadResponse;
+      const previewUrl = URL.createObjectURL(file);
+      onUploaded({
+        ...uploaded,
+        width: uploaded.video_width ?? uploaded.width,
+        height: uploaded.video_height ?? uploaded.height,
+        size: uploaded.size ?? file.size,
+        preview_url: previewUrl
+      });
+      setMessage(`${uploaded.width} x ${uploaded.height} · ${uploaded.fps} fps`);
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "上传失败");
     } finally {
@@ -67,41 +84,49 @@ export function VideoUploader({ apiBaseUrl, video, onUploaded }: Props) {
   }
 
   return (
-    <section className="control-card upload-panel">
-      <div className="step-heading">
-        <h2>1. 上传视频</h2>
+    <section className="panel upload-panel">
+      <div className="panel-heading">
+        <span className="eyebrow">Source</span>
+        <h2>视频文件</h2>
       </div>
 
-      <div className="upload-row">
-        <input
-          ref={inputRef}
-          className="file-input"
-          type="file"
-          accept=".mp4,.mov,.webm,video/mp4,video/quicktime,video/webm"
-          onChange={handleFileChange}
-        />
+      <input
+        ref={inputRef}
+        className="file-input"
+        type="file"
+        accept=".mp4,.mov,.webm,video/mp4,video/quicktime,video/webm"
+        onChange={handleFileChange}
+      />
 
-        <button type="button" className="upload-drop" onClick={() => inputRef.current?.click()}>
-          <span className="upload-icon">⇧</span>
-          <strong>上传视频</strong>
-          <small>支持 MP4 / MOV / WEBM，文件 ≤ 500MB</small>
-        </button>
+      <button type="button" className="upload-drop" onClick={() => inputRef.current?.click()}>
+        <span className="upload-icon">+</span>
+        <strong>选择视频</strong>
+        <small>MP4 / MOV / WEBM · 最大 500MB</small>
+      </button>
 
-        <div className="uploaded-file">
-          <div className="file-thumb">▶</div>
-          <div>
-            <strong>{video?.filename ?? selectedName}</strong>
-            <span>{video ? `${video.width} × ${video.height} · ${video.fps} fps` : "等待选择视频"}</span>
-          </div>
-          {video ? <span className="ok-dot">✓</span> : null}
+      <div className="file-summary">
+        <div className="file-thumb">▶</div>
+        <div>
+          <strong>{video?.filename ?? selectedName}</strong>
+          <span>{video ? `${video.width} x ${video.height}` : selectedSize ? formatBytes(selectedSize) : "等待上传"}</span>
         </div>
       </div>
 
-      <button type="button" className="primary-button full-width upload-confirm" disabled={isUploading} onClick={uploadSelected}>
-        {isUploading ? "上传中" : "确认上传"}
+      <button type="button" className="primary-button full-width" disabled={isUploading} onClick={uploadSelected}>
+        {isUploading ? "上传中" : "上传并创建本地预览"}
       </button>
 
-      <div className="file-line">{message ? <strong>{message}</strong> : null}</div>
+      <div className="status-line">{message ? <span>{message}</span> : null}</div>
     </section>
   );
+}
+
+function formatBytes(bytes: number) {
+  if (bytes <= 0) {
+    return "0 B";
+  }
+  const units = ["B", "KB", "MB", "GB"];
+  const index = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+  const value = bytes / 1024 ** index;
+  return `${value.toFixed(value >= 10 || index === 0 ? 0 : 1)} ${units[index]}`;
 }
