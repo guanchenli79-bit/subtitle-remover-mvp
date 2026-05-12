@@ -1,6 +1,6 @@
 "use client";
 
-import { PointerEvent, useEffect, useMemo, useRef, useState } from "react";
+import { PointerEvent, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import type { UploadedVideo } from "./VideoUploader";
 
 export type DisplayRect = {
@@ -36,6 +36,8 @@ type Props = {
   onSelectionChange: (selection: SelectionState | null) => void;
   onVideoMetadata: (metadata: VideoMetadata) => void;
 };
+
+type PreviewMode = "before" | "after" | "mask" | "repair";
 
 type Point = {
   x: number;
@@ -76,6 +78,7 @@ export function VideoAnnotator({
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(video.duration || 0);
+  const [previewMode, setPreviewMode] = useState<PreviewMode>("before");
   const [metadata, setMetadata] = useState<VideoMetadata>({
     width: video.width,
     height: video.height,
@@ -119,6 +122,9 @@ export function VideoAnnotator({
   }, [metadata.width, metadata.height, video.width, video.height]);
 
   const activeRect = draftRect ?? selection?.displayRect ?? null;
+  const usesOutputPreview = (previewMode === "after" || previewMode === "repair") && Boolean(outputUrl);
+  const activeVideoUrl = usesOutputPreview && outputUrl ? outputUrl : videoUrl;
+  const canEditSelection = previewMode === "before" || previewMode === "mask";
 
   function handleLoadedMetadata() {
     const element = videoRef.current;
@@ -178,6 +184,16 @@ export function VideoAnnotator({
 
   function restart() {
     seekTo(0);
+  }
+
+  function stepFrame(direction: -1 | 1) {
+    const element = videoRef.current;
+    if (!element) {
+      return;
+    }
+    element.pause();
+    const fps = Math.max(1, video.fps || 25);
+    seekTo(element.currentTime + direction / fps);
   }
 
   function jumpToCheckpoint() {
@@ -343,12 +359,19 @@ export function VideoAnnotator({
           <div className="time-readout">当前帧 {formatTime(currentTime)}</div>
         </div>
 
+        <div className="preview-tabs" aria-label="预览模式">
+          <PreviewTab active={previewMode === "before"} label="Before" onClick={() => setPreviewMode("before")} />
+          <PreviewTab active={previewMode === "after"} label="After" onClick={() => setPreviewMode("after")} />
+          <PreviewTab active={previewMode === "mask"} label="Mask" onClick={() => setPreviewMode("mask")} />
+          <PreviewTab active={previewMode === "repair"} label="Frame Repair" onClick={() => setPreviewMode("repair")} />
+        </div>
+
         <div className="video-shell">
           <div className="video-canvas" style={{ aspectRatio, maxWidth: `min(100%, ${Math.min(160, Math.max(32, 70 * videoRatio))}vh)` }}>
             <video
               ref={videoRef}
               className="preview-video"
-              src={videoUrl}
+              src={activeVideoUrl}
               controls={false}
               playsInline
               preload="metadata"
@@ -361,7 +384,7 @@ export function VideoAnnotator({
             <div
               ref={overlayRef}
               className="annotation-layer"
-              onPointerDown={handleLayerPointerDown}
+              onPointerDown={canEditSelection ? handleLayerPointerDown : undefined}
               onPointerMove={handlePointerMove}
               onPointerUp={handlePointerUp}
               onPointerCancel={() => {
@@ -369,17 +392,26 @@ export function VideoAnnotator({
                 setDraftRect(null);
               }}
             >
-              {activeRect ? (
-                <div className="selection-box" style={rectStyle(activeRect)} onPointerDown={handleSelectionPointerDown}>
-                  {RESIZE_HANDLES.map((handle) => (
-                    <div
-                      key={handle}
-                      className={`resize-handle ${handle}`}
-                      onPointerDown={(event) => handleResizePointerDown(handle, event)}
-                    />
-                  ))}
+              {activeRect && previewMode !== "after" ? (
+                <div
+                  className={`selection-box ${previewMode === "mask" ? "mask-preview" : ""}`}
+                  style={rectStyle(activeRect)}
+                  onPointerDown={canEditSelection ? handleSelectionPointerDown : undefined}
+                >
+                  {previewMode === "mask" ? <div className="mask-fill" /> : null}
+                  {canEditSelection
+                    ? RESIZE_HANDLES.map((handle) => (
+                        <div
+                          key={handle}
+                          className={`resize-handle ${handle}`}
+                          onPointerDown={(event) => handleResizePointerDown(handle, event)}
+                        />
+                      ))
+                    : null}
                 </div>
               ) : null}
+              {previewMode === "after" && !outputUrl ? <div className="preview-watermark">等待处理结果</div> : null}
+              {previewMode === "repair" && !outputUrl ? <div className="preview-watermark">完成处理后显示当前帧修复预览</div> : null}
             </div>
           </div>
         </div>
@@ -390,6 +422,12 @@ export function VideoAnnotator({
           </button>
           <button type="button" className="control-button" onClick={restart}>
             回到开头
+          </button>
+          <button type="button" className="control-button icon-button" onClick={() => stepFrame(-1)} aria-label="上一帧">
+            -1f
+          </button>
+          <button type="button" className="control-button icon-button" onClick={() => stepFrame(1)} aria-label="下一帧">
+            +1f
           </button>
           <button type="button" className="control-button" onClick={jumpToCheckpoint}>
             跳到检查点
@@ -417,16 +455,55 @@ export function VideoAnnotator({
 
       <section className="viewer-panel result-panel">
         <div className="panel-heading">
-          <span className="eyebrow">Result</span>
-          <h2>处理结果预览</h2>
+          <div>
+            <span className="eyebrow">Compare</span>
+            <h2>前后对比与诊断预览</h2>
+          </div>
         </div>
-        {outputUrl ? (
-          <video className="result-video" src={outputUrl} controls preload="metadata" />
-        ) : (
-          <div className="result-placeholder">处理完成后可在这里预览导出视频</div>
-        )}
+        <div className="compare-grid">
+          <PreviewCard title="Before" subtitle="原始帧">
+            <video className="result-video" src={videoUrl} muted preload="metadata" />
+          </PreviewCard>
+          <PreviewCard title="After" subtitle={outputUrl ? "导出结果" : "等待输出"}>
+            {outputUrl ? <video className="result-video" src={outputUrl} controls preload="metadata" /> : <div className="result-placeholder">处理完成后显示</div>}
+          </PreviewCard>
+          <PreviewCard title="Mask" subtitle="当前选区 mask 预览">
+            <div className="diagnostic-preview mask-diagnostic">{selection ? "MASK" : "未框选"}</div>
+          </PreviewCard>
+          <PreviewCard title="Frame repair" subtitle="当前帧修复预览">
+            <div className="diagnostic-preview repair-diagnostic">{outputUrl ? "已生成" : "等待处理"}</div>
+          </PreviewCard>
+        </div>
       </section>
     </>
+  );
+}
+
+function PreviewTab({ active, label, onClick }: { active: boolean; label: string; onClick: () => void }) {
+  return (
+    <button type="button" className={active ? "active" : ""} onClick={onClick}>
+      {label}
+    </button>
+  );
+}
+
+function PreviewCard({
+  title,
+  subtitle,
+  children
+}: {
+  title: string;
+  subtitle: string;
+  children: ReactNode;
+}) {
+  return (
+    <div className="compare-card">
+      <div>
+        <strong>{title}</strong>
+        <span>{subtitle}</span>
+      </div>
+      {children}
+    </div>
   );
 }
 

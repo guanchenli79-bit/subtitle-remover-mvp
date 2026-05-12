@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+from collections import deque
 from pathlib import Path
+from time import monotonic
 from typing import Literal
 
 import cv2
@@ -14,17 +16,12 @@ import storage
 
 InpaintMethod = Literal["TELEA", "NS"]
 InpaintStrength = Literal["low", "medium", "high"]
+RepairMode = Literal["fast", "balanced", "high_quality"]
 
 STRENGTH_RADIUS: dict[str, int] = {
     "low": 2,
     "medium": 3,
     "high": 5,
-}
-
-FALLBACK_ALPHA: dict[str, float] = {
-    "low": 0.18,
-    "medium": 0.28,
-    "high": 0.4,
 }
 
 
@@ -60,136 +57,307 @@ def build_text_mask(
     roi: np.ndarray,
     *,
     threshold: int,
+    detection_sensitivity: float,
+    min_component_area: int | None,
+    max_component_area: int | None,
     mask_dilate: int,
+    ocr_confirm: bool,
 ) -> np.ndarray:
     if roi.size == 0:
         return np.zeros((0, 0), dtype=np.uint8)
 
+    sensitivity = float(np.clip(detection_sensitivity, 0.1, 1.0))
     threshold = int(np.clip(threshold, 0, 255))
     mask_dilate = int(np.clip(mask_dilate, 0, 30))
 
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    gray = cv2.createCLAHE(clipLimit=2.0 + sensitivity * 1.8, tileGridSize=(8, 8)).apply(gray)
     blur = cv2.GaussianBlur(gray, (3, 3), 0)
     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
 
-    _, bright_mask = cv2.threshold(blur, threshold, 255, cv2.THRESH_BINARY)
+    bright_threshold = int(np.clip(min(threshold, 226 - sensitivity * 72), 112, 242))
+    _, bright_mask = cv2.threshold(blur, bright_threshold, 255, cv2.THRESH_BINARY)
     white_mask = cv2.inRange(
         hsv,
-        np.array([0, 0, max(145, threshold - 35)], dtype=np.uint8),
-        np.array([179, 96, 255], dtype=np.uint8),
+        np.array([0, 0, max(120, bright_threshold - 32)], dtype=np.uint8),
+        np.array([179, int(118 - sensitivity * 42), 255], dtype=np.uint8),
     )
     yellow_mask = cv2.inRange(
         hsv,
-        np.array([15, 45, max(90, threshold - 80)], dtype=np.uint8),
-        np.array([45, 255, 255], dtype=np.uint8),
+        np.array([12, 35, max(86, bright_threshold - 88)], dtype=np.uint8),
+        np.array([48, 255, 255], dtype=np.uint8),
     )
 
-    edges = cv2.Canny(blur, 48, 150)
-    edge_band = cv2.dilate(edges, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), iterations=1)
-
-    adaptive_text = np.zeros_like(gray)
-    dark_adaptive_text = np.zeros_like(gray)
     min_dim = min(gray.shape[:2])
+    adaptive_text = np.zeros_like(gray)
+    dark_outline = np.zeros_like(gray)
     if min_dim >= 3:
-        block_size = min(41, min_dim if min_dim % 2 == 1 else min_dim - 1)
+        block_size = min(45, min_dim if min_dim % 2 == 1 else min_dim - 1)
         block_size = max(3, block_size)
-        adaptive = cv2.adaptiveThreshold(
+        c_value = int(10 - sensitivity * 8)
+        adaptive_text = cv2.adaptiveThreshold(
             blur,
             255,
             cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
             cv2.THRESH_BINARY,
             block_size,
-            -2,
+            c_value,
         )
-        dark_adaptive = cv2.adaptiveThreshold(
+        dark_outline = cv2.adaptiveThreshold(
             blur,
             255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.ADAPTIVE_THRESH_MEAN_C,
             cv2.THRESH_BINARY_INV,
             block_size,
-            4,
+            max(2, c_value + 4),
         )
-        adaptive_text = cv2.bitwise_and(adaptive, edge_band)
-        dark_adaptive_text = cv2.bitwise_and(dark_adaptive, edge_band)
+
+    low_edge = int(72 - sensitivity * 34)
+    high_edge = int(172 - sensitivity * 56)
+    edges = cv2.Canny(blur, max(22, low_edge), max(70, high_edge))
+    gradient = cv2.morphologyEx(blur, cv2.MORPH_GRADIENT, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
+    _, gradient_mask = cv2.threshold(gradient, int(22 - sensitivity * 10), 255, cv2.THRESH_BINARY)
 
     text_seed = cv2.bitwise_or(cv2.bitwise_or(bright_mask, white_mask), yellow_mask)
-    nearby_text = cv2.dilate(text_seed, cv2.getStructuringElement(cv2.MORPH_RECT, (5, 3)), iterations=1)
-    edge_mask = cv2.bitwise_and(edges, nearby_text)
-
-    mask = cv2.bitwise_or(text_seed, adaptive_text)
-    mask = cv2.bitwise_or(mask, dark_adaptive_text)
-    mask = cv2.bitwise_or(mask, edge_mask)
-    mask = cv2.morphologyEx(
-        mask,
-        cv2.MORPH_CLOSE,
-        cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
-        iterations=1,
+    adaptive_edge = cv2.bitwise_and(adaptive_text, cv2.dilate(edges, kernel(3, "rect"), iterations=1))
+    outline_band = cv2.bitwise_and(dark_outline, cv2.dilate(text_seed, kernel(5, "rect"), iterations=1))
+    edge_near_text = cv2.bitwise_and(
+        cv2.bitwise_or(edges, gradient_mask),
+        cv2.dilate(cv2.bitwise_or(text_seed, adaptive_text), kernel(5, "rect"), iterations=1),
     )
-    mask = filter_text_components(mask, roi.shape[:2])
+
+    mask = cv2.bitwise_or(text_seed, adaptive_edge)
+    mask = cv2.bitwise_or(mask, outline_band)
+    mask = cv2.bitwise_or(mask, edge_near_text)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel(3, "rect"), iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel(2, "rect"), iterations=1)
+    mask = filter_text_components(
+        mask,
+        roi.shape[:2],
+        sensitivity=sensitivity,
+        min_component_area=min_component_area,
+        max_component_area=max_component_area,
+    )
+
+    if ocr_confirm:
+        mask = apply_optional_ocr_support(roi, mask)
 
     if mask_dilate > 0 and cv2.countNonZero(mask) > 0:
-        kernel_size = mask_dilate * 2 + 1
-        mask = cv2.dilate(
-            mask,
-            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size)),
-            iterations=1,
-        )
+        kernel_size = mask_dilate if mask_dilate % 2 == 1 else mask_dilate + 1
+        kernel_size = max(3, kernel_size)
+        mask = cv2.dilate(mask, kernel(kernel_size, "ellipse"), iterations=1)
 
     return mask
 
 
-def filter_text_components(mask: np.ndarray, roi_shape: tuple[int, int]) -> np.ndarray:
+def filter_text_components(
+    mask: np.ndarray,
+    roi_shape: tuple[int, int],
+    *,
+    sensitivity: float,
+    min_component_area: int | None,
+    max_component_area: int | None,
+) -> np.ndarray:
     if cv2.countNonZero(mask) == 0:
         return mask
 
     roi_height, roi_width = roi_shape
     roi_area = max(1, roi_height * roi_width)
-    min_area = max(3, int(roi_area * 0.000015))
-    max_area = max(32, int(roi_area * 0.32))
+    min_area = min_component_area or max(3, int(roi_area * (0.00001 + (1.0 - sensitivity) * 0.00003)))
+    max_area = max_component_area or max(32, int(roi_area * (0.18 + sensitivity * 0.08)))
 
     label_count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
     clean = np.zeros_like(mask)
 
     for label in range(1, label_count):
-        x, y, width, height, area = stats[label]
+        _, _, width, height, area = stats[label]
         if area < min_area or area > max_area:
             continue
-        if width > roi_width * 0.98 and height > roi_height * 0.9:
+        if width <= 1 or height <= 1:
+            continue
+        if width > roi_width * 0.98 and height > roi_height * 0.72:
             continue
         fill_ratio = area / max(1, width * height)
-        if fill_ratio > 0.92 and area > roi_area * 0.015:
+        if fill_ratio > 0.9 and area > roi_area * 0.01:
             continue
         clean[labels == label] = 255
 
-    return clean if cv2.countNonZero(clean) > 0 else mask
+    if cv2.countNonZero(clean) == 0:
+        return mask
+    return clean
 
 
-def repair_roi(
+def apply_optional_ocr_support(roi: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    try:
+        import pytesseract  # type: ignore
+    except Exception:
+        return mask
+
+    try:
+        data = pytesseract.image_to_data(roi, output_type=pytesseract.Output.DICT)
+    except Exception:
+        return mask
+
+    ocr_mask = np.zeros(mask.shape, dtype=np.uint8)
+    for index, text in enumerate(data.get("text", [])):
+        if not str(text).strip():
+            continue
+        try:
+            confidence = float(data.get("conf", [0])[index])
+        except (TypeError, ValueError):
+            confidence = 0.0
+        if confidence < 18:
+            continue
+        x = int(data["left"][index])
+        y = int(data["top"][index])
+        width = int(data["width"][index])
+        height = int(data["height"][index])
+        cv2.rectangle(ocr_mask, (x, y), (x + width, y + height), 255, -1)
+
+    if cv2.countNonZero(ocr_mask) == 0:
+        return mask
+
+    supported = cv2.bitwise_and(cv2.dilate(mask, kernel(9, "rect"), iterations=1), ocr_mask)
+    return cv2.bitwise_or(mask, supported)
+
+
+def stabilize_temporal_masks(
+    raw_masks: list[np.ndarray],
+    *,
+    temporal_window: int,
+    min_mask_pixels: int,
+) -> tuple[list[np.ndarray], int]:
+    if not raw_masks:
+        return [], 0
+
+    window = int(np.clip(temporal_window, 0, 3))
+    stabilized: list[np.ndarray] = []
+    last_good: np.ndarray | None = None
+    hold_frames = 0
+    recovered_frames = 0
+
+    for index, current in enumerate(raw_masks):
+        start = max(0, index - window)
+        end = min(len(raw_masks), index + window + 1)
+        neighbors = raw_masks[start:end]
+        current_pixels = cv2.countNonZero(current)
+
+        votes = np.zeros(current.shape, dtype=np.uint16)
+        for neighbor in neighbors:
+            votes += (neighbor > 0).astype(np.uint16)
+
+        vote_threshold = 2 if len(neighbors) >= 3 else 1
+        voted = np.where(votes >= vote_threshold, 255, 0).astype(np.uint8)
+
+        if current_pixels >= min_mask_pixels:
+            stable = cv2.bitwise_or(current, voted)
+            last_good = stable
+            hold_frames = window + 1
+        elif cv2.countNonZero(voted) >= min_mask_pixels:
+            stable = voted
+            last_good = stable
+            hold_frames = window
+            recovered_frames += 1
+        elif last_good is not None and hold_frames > 0:
+            stable = last_good.copy()
+            hold_frames -= 1
+            recovered_frames += 1
+        else:
+            stable = current
+
+        stable = cv2.morphologyEx(stable, cv2.MORPH_CLOSE, kernel(3, "ellipse"), iterations=1)
+        stabilized.append(stable)
+
+    return stabilized, recovered_frames
+
+
+def repair_roi_with_temporal_sources(
     roi: np.ndarray,
     mask: np.ndarray,
+    neighbors: list[tuple[np.ndarray, np.ndarray, float]],
     *,
+    repair_mode: str,
     inpaint_radius: int,
     feather_radius: int,
     inpaint_method: int,
-    blend_alpha: float = 1.0,
 ) -> np.ndarray:
     if roi.size == 0 or mask.size == 0 or cv2.countNonZero(mask) == 0:
         return roi
 
-    inpaint_radius = int(np.clip(inpaint_radius, 1, 20))
-    feather_radius = int(np.clip(feather_radius, 0, 20))
-    blend_alpha = float(np.clip(blend_alpha, 0.0, 1.0))
+    mask_bool = mask > 0
+    temporal_roi = roi.copy()
+    weight_sum = np.zeros(mask.shape, dtype=np.float32)
+    accum = np.zeros(roi.shape, dtype=np.float32)
 
-    repaired = cv2.inpaint(roi, mask, inpaint_radius, inpaint_method)
+    for neighbor_roi, neighbor_mask, weight in neighbors:
+        aligned_roi, map_x, map_y = align_neighbor_to_current(neighbor_roi, roi, repair_mode)
+        if map_x is not None and map_y is not None:
+            aligned_mask = cv2.remap(neighbor_mask, map_x, map_y, cv2.INTER_NEAREST, borderMode=cv2.BORDER_REFLECT)
+        else:
+            aligned_mask = neighbor_mask
+
+        valid = mask_bool & (aligned_mask < 16)
+        if cv2.countNonZero(valid.astype(np.uint8)) < max(4, int(cv2.countNonZero(mask) * 0.03)):
+            continue
+        accum[valid] += aligned_roi[valid].astype(np.float32) * weight
+        weight_sum[valid] += weight
+
+    temporal_pixels = weight_sum > 0
+    if cv2.countNonZero(temporal_pixels.astype(np.uint8)) > 0:
+        temporal_roi[temporal_pixels] = np.clip(
+            accum[temporal_pixels] / weight_sum[temporal_pixels][..., None],
+            0,
+            255,
+        ).astype(np.uint8)
+
+    remaining_mask = np.where(mask_bool & ~temporal_pixels, 255, 0).astype(np.uint8)
+    if cv2.countNonZero(remaining_mask) > 0:
+        temporal_roi = cv2.inpaint(
+            temporal_roi,
+            remaining_mask,
+            int(np.clip(inpaint_radius, 1, 20)),
+            inpaint_method,
+        )
+
+    return feather_blend(roi, temporal_roi, mask, feather_radius)
+
+
+def align_neighbor_to_current(
+    neighbor_roi: np.ndarray,
+    current_roi: np.ndarray,
+    repair_mode: str,
+) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None]:
+    if repair_mode == "fast" or neighbor_roi.shape != current_roi.shape:
+        return neighbor_roi, None, None
+
+    try:
+        neighbor_gray = cv2.cvtColor(neighbor_roi, cv2.COLOR_BGR2GRAY)
+        current_gray = cv2.cvtColor(current_roi, cv2.COLOR_BGR2GRAY)
+        if repair_mode == "high_quality":
+            flow = cv2.calcOpticalFlowFarneback(neighbor_gray, current_gray, None, 0.5, 4, 25, 5, 7, 1.5, 0)
+        else:
+            flow = cv2.calcOpticalFlowFarneback(neighbor_gray, current_gray, None, 0.5, 3, 17, 3, 5, 1.2, 0)
+        height, width = current_gray.shape
+        grid_x, grid_y = np.meshgrid(np.arange(width), np.arange(height))
+        map_x = (grid_x - flow[..., 0]).astype(np.float32)
+        map_y = (grid_y - flow[..., 1]).astype(np.float32)
+        aligned = cv2.remap(neighbor_roi, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+        return aligned, map_x, map_y
+    except Exception:
+        return neighbor_roi, None, None
+
+
+def feather_blend(original: np.ndarray, repaired: np.ndarray, mask: np.ndarray, feather_radius: int) -> np.ndarray:
+    feather_radius = int(np.clip(feather_radius, 0, 20))
     if feather_radius > 0:
-        kernel_size = feather_radius * 2 + 1
-        blurred = cv2.GaussianBlur(mask, (kernel_size, kernel_size), 0)
-        alpha = np.maximum(mask, blurred).astype(np.float32) / 255.0
+        blur_size = feather_radius * 2 + 1
+        alpha = cv2.GaussianBlur(mask, (blur_size, blur_size), 0).astype(np.float32) / 255.0
+        alpha = np.maximum(alpha, (mask > 0).astype(np.float32) * 0.72)
     else:
         alpha = (mask > 0).astype(np.float32)
 
-    alpha = np.clip(alpha * blend_alpha, 0.0, 1.0)[..., None]
-    blended = repaired.astype(np.float32) * alpha + roi.astype(np.float32) * (1.0 - alpha)
+    alpha = np.clip(alpha, 0.0, 1.0)[..., None]
+    blended = repaired.astype(np.float32) * alpha + original.astype(np.float32) * (1.0 - alpha)
     return np.clip(blended, 0, 255).astype(np.uint8)
 
 
@@ -268,9 +436,16 @@ def process_video(
     work_dir: Path | None = None
     capture: cv2.VideoCapture | None = None
     writer: cv2.VideoWriter | None = None
+    started_at = monotonic()
 
     try:
-        jobs.update_job(job_id, status="probing", progress=0.03, message="正在读取视频信息")
+        jobs.update_job(
+            job_id,
+            status="analyze",
+            progress=0.03,
+            stage_progress=0.15,
+            message="正在分析视频参数",
+        )
         original_path = storage.get_upload_path(video_id)
         metadata = storage.read_video_metadata(video_id)
 
@@ -294,17 +469,102 @@ def process_video(
         strength = str(options.get("inpaint_strength") or "medium").lower()
         if strength not in STRENGTH_RADIUS:
             strength = "medium"
+        repair_mode = str(options.get("repair_mode") or "balanced").lower()
+        if repair_mode not in {"fast", "balanced", "high_quality"}:
+            repair_mode = "balanced"
 
         inpaint_radius = options.get("inpaint_radius")
         inpaint_radius = int(inpaint_radius) if inpaint_radius is not None else STRENGTH_RADIUS[strength]
-        feather_radius = int(options.get("feather_radius") if options.get("feather_radius") is not None else 6)
+        feather_radius = int(options.get("feather_radius") if options.get("feather_radius") is not None else 8)
+        detection_sensitivity = float(options.get("detection_sensitivity") or 0.68)
+        temporal_window = int(np.clip(options.get("temporal_window") or 0, 0, 3))
+        if repair_mode == "high_quality":
+            temporal_window = max(temporal_window, 2)
+        elif repair_mode == "fast":
+            temporal_window = min(temporal_window, 1)
+        min_component_area = options.get("min_component_area")
+        max_component_area = options.get("max_component_area")
         keep_audio = bool(options.get("keep_audio", True))
+        ocr_confirm = bool(options.get("ocr_confirm", False))
         method_name = str(options.get("method", "TELEA")).upper()
         inpaint_method = cv2.INPAINT_NS if method_name == "NS" else cv2.INPAINT_TELEA
 
         work_dir = storage.create_work_dir(job_id)
         silent_video_path = work_dir / "processed_no_audio.mp4"
         output_path = storage.output_path(job_id)
+
+        raw_masks: list[np.ndarray] = []
+        frame_index = 0
+        detected_frames = 0
+        min_mask_pixels = max(4, int(w * h * 0.00015))
+
+        jobs.update_job(
+            job_id,
+            status="detect",
+            progress=0.08,
+            stage_progress=0.0,
+            total_frames=total_frames,
+            message="正在检测字幕 mask",
+        )
+        while True:
+            if is_canceled(job_id):
+                raise ProcessingCanceled("任务已取消")
+
+            ok, frame = capture.read()
+            if not ok:
+                break
+
+            roi = frame[y : y + h, x : x + w]
+            mask = build_text_mask(
+                roi,
+                threshold=threshold,
+                detection_sensitivity=detection_sensitivity,
+                min_component_area=int(min_component_area) if min_component_area is not None else None,
+                max_component_area=int(max_component_area) if max_component_area is not None else None,
+                mask_dilate=mask_dilate,
+                ocr_confirm=ocr_confirm,
+            )
+            raw_masks.append(mask)
+            if cv2.countNonZero(mask) >= min_mask_pixels:
+                detected_frames += 1
+
+            frame_index += 1
+            if frame_index % 5 == 0 or frame_index == total_frames:
+                update_progress(
+                    job_id,
+                    status="detect",
+                    stage_start=0.08,
+                    stage_span=0.4,
+                    stage_frame=frame_index,
+                    total_frames=total_frames,
+                    started_at=started_at,
+                    message=f"检测字幕 {frame_index}/{total_frames or '?'} 帧，命中 {detected_frames} 帧",
+                )
+
+        capture.release()
+        capture = None
+
+        if frame_index == 0:
+            raise RuntimeError("No frames were decoded from the uploaded video")
+
+        jobs.update_job(
+            job_id,
+            status="analyze",
+            progress=0.5,
+            stage_progress=0.75,
+            current_frame=frame_index,
+            total_frames=frame_index,
+            message="正在做时序投票和短暂漏检补偿",
+        )
+        stable_masks, recovered_frames = stabilize_temporal_masks(
+            raw_masks,
+            temporal_window=temporal_window,
+            min_mask_pixels=min_mask_pixels,
+        )
+
+        capture = cv2.VideoCapture(str(original_path))
+        if not capture.isOpened():
+            raise RuntimeError("Could not reopen uploaded video for repair")
 
         writer = cv2.VideoWriter(
             str(silent_video_path),
@@ -315,79 +575,110 @@ def process_video(
         if not writer.isOpened():
             raise RuntimeError("Could not create temporary output video")
 
-        jobs.update_job(job_id, status="processing_frames", progress=0.1, message="开始逐帧处理")
-        frame_index = 0
-        fallback_frames = 0
-        min_mask_pixels = max(5, int(w * h * 0.0002))
+        jobs.update_job(
+            job_id,
+            status="repair",
+            progress=0.52,
+            stage_progress=0.0,
+            current_frame=0,
+            total_frames=frame_index,
+            message="正在使用相邻帧恢复背景",
+        )
 
-        while True:
+        lookahead: deque[tuple[int, np.ndarray]] = deque()
+        history: deque[tuple[int, np.ndarray]] = deque(maxlen=temporal_window)
+        next_index = 0
+
+        def read_next_frame() -> bool:
+            nonlocal next_index
+            ok, next_frame = capture.read() if capture is not None else (False, None)
+            if not ok or next_frame is None:
+                return False
+            lookahead.append((next_index, next_frame))
+            next_index += 1
+            return True
+
+        for _ in range(temporal_window + 1):
+            if not read_next_frame():
+                break
+
+        repaired_frames = 0
+        while lookahead:
             if is_canceled(job_id):
                 raise ProcessingCanceled("任务已取消")
 
-            ok, frame = capture.read()
-            if not ok:
-                break
+            current_index, current_frame = lookahead[0]
+            original_frame = current_frame.copy()
+            current_roi = current_frame[y : y + h, x : x + w]
+            current_mask = stable_masks[current_index]
 
-            roi = frame[y : y + h, x : x + w]
-            mask = build_text_mask(roi, threshold=threshold, mask_dilate=mask_dilate)
-            use_fallback = cv2.countNonZero(mask) < min_mask_pixels
+            neighbor_records = build_neighbor_records(
+                current_index=current_index,
+                history=list(history),
+                future=list(lookahead)[1:],
+                stable_masks=stable_masks,
+                rect=(x, y, w, h),
+                repair_mode=repair_mode,
+            )
+            repaired_roi = repair_roi_with_temporal_sources(
+                current_roi,
+                current_mask,
+                neighbor_records,
+                repair_mode=repair_mode,
+                inpaint_radius=inpaint_radius,
+                feather_radius=feather_radius,
+                inpaint_method=inpaint_method,
+            )
+            current_frame[y : y + h, x : x + w] = repaired_roi
+            writer.write(current_frame)
 
-            if use_fallback:
-                fallback_frames += 1
-                mask = np.full((h, w), 255, dtype=np.uint8)
-                repaired_roi = repair_roi(
-                    roi,
-                    mask,
-                    inpaint_radius=max(1, min(2, inpaint_radius)),
-                    feather_radius=max(feather_radius, 10),
-                    inpaint_method=inpaint_method,
-                    blend_alpha=FALLBACK_ALPHA[strength],
+            history.append((current_index, original_frame))
+            lookahead.popleft()
+            read_next_frame()
+            repaired_frames += 1
+
+            if repaired_frames % 5 == 0 or repaired_frames == frame_index:
+                update_progress(
+                    job_id,
+                    status="repair",
+                    stage_start=0.52,
+                    stage_span=0.38,
+                    stage_frame=repaired_frames,
+                    total_frames=frame_index,
+                    started_at=started_at,
+                    message=(
+                        f"修复画面 {repaired_frames}/{frame_index} 帧，"
+                        f"时序补偿 {recovered_frames} 帧"
+                    ),
                 )
-            else:
-                repaired_roi = repair_roi(
-                    roi,
-                    mask,
-                    inpaint_radius=inpaint_radius,
-                    feather_radius=feather_radius,
-                    inpaint_method=inpaint_method,
-                )
-
-            frame[y : y + h, x : x + w] = repaired_roi
-            writer.write(frame)
-            frame_index += 1
-
-            if frame_index % 5 == 0 or frame_index == total_frames:
-                if total_frames > 0:
-                    progress = 0.1 + (frame_index / total_frames) * 0.78
-                    message = f"已处理 {frame_index}/{total_frames} 帧"
-                else:
-                    progress = min(0.88, 0.1 + frame_index * 0.002)
-                    message = f"已处理 {frame_index} 帧"
-                if fallback_frames:
-                    message = f"{message}，{fallback_frames} 帧使用轻度兜底修复"
-                jobs.update_job(job_id, status="processing_frames", progress=progress, message=message)
 
         capture.release()
+        capture = None
         writer.release()
-
-        if frame_index == 0:
-            raise RuntimeError("No frames were decoded from the uploaded video")
+        writer = None
 
         if is_canceled(job_id):
             raise ProcessingCanceled("任务已取消")
 
         jobs.update_job(
             job_id,
-            status="muxing_audio",
-            progress=0.93,
+            status="merge",
+            progress=0.94,
+            stage_progress=0.25,
+            current_frame=frame_index,
+            total_frames=frame_index,
             message="正在合成原音频" if keep_audio else "正在导出 MP4",
         )
         mux_audio(original_path, silent_video_path, output_path, keep_audio=keep_audio)
 
         jobs.update_job(
             job_id,
-            status="completed",
+            status="done",
             progress=1.0,
+            stage_progress=1.0,
+            current_frame=frame_index,
+            total_frames=frame_index,
+            eta_seconds=0.0,
             message="处理完成",
             download_url=f"/api/download/{job_id}",
         )
@@ -395,6 +686,7 @@ def process_video(
         jobs.update_job(
             job_id,
             status="canceled",
+            stage="canceled",
             message=str(exc),
         )
     except Exception as exc:
@@ -402,6 +694,7 @@ def process_video(
             job_id,
             status="failed",
             progress=0.0,
+            stage="failed",
             message=str(exc),
         )
     finally:
@@ -411,6 +704,68 @@ def process_video(
             writer.release()
         if work_dir is not None:
             storage.cleanup_work_dir(job_id)
+
+
+def build_neighbor_records(
+    *,
+    current_index: int,
+    history: list[tuple[int, np.ndarray]],
+    future: list[tuple[int, np.ndarray]],
+    stable_masks: list[np.ndarray],
+    rect: tuple[int, int, int, int],
+    repair_mode: str,
+) -> list[tuple[np.ndarray, np.ndarray, float]]:
+    x, y, w, h = rect
+    if repair_mode == "fast":
+        candidates = history[-1:] + future[:1]
+    elif repair_mode == "high_quality":
+        candidates = history + future
+    else:
+        candidates = history[-2:] + future[:2]
+
+    records: list[tuple[np.ndarray, np.ndarray, float]] = []
+    for neighbor_index, frame in candidates:
+        if neighbor_index < 0 or neighbor_index >= len(stable_masks):
+            continue
+        distance = max(1, abs(neighbor_index - current_index))
+        weight = 1.0 / distance
+        records.append((frame[y : y + h, x : x + w], stable_masks[neighbor_index], weight))
+    return records
+
+
+def update_progress(
+    job_id: str,
+    *,
+    status: str,
+    stage_start: float,
+    stage_span: float,
+    stage_frame: int,
+    total_frames: int,
+    started_at: float,
+    message: str,
+) -> None:
+    denominator = max(1, total_frames)
+    stage_progress = min(1.0, stage_frame / denominator)
+    progress = stage_start + stage_progress * stage_span
+    elapsed = max(0.001, monotonic() - started_at)
+    eta_seconds = (elapsed / max(progress, 0.001)) * (1.0 - progress)
+    jobs.update_job(
+        job_id,
+        status=status,
+        progress=progress,
+        stage_progress=stage_progress,
+        current_frame=stage_frame,
+        total_frames=total_frames,
+        eta_seconds=eta_seconds,
+        message=message,
+    )
+
+
+def kernel(size: int, shape: Literal["rect", "ellipse"]) -> np.ndarray:
+    size = max(1, int(size))
+    if shape == "ellipse":
+        return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
+    return cv2.getStructuringElement(cv2.MORPH_RECT, (size, size))
 
 
 def is_canceled(job_id: str) -> bool:

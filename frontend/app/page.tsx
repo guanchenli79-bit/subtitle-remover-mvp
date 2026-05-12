@@ -45,7 +45,7 @@ export default function Home() {
     });
     setSelection(null);
     setJobId(null);
-    setProgress({ status: "uploaded", progress: 0.05, message: "视频已上传，正在读取本地预览", download_url: null });
+    setProgress({ status: "upload", progress: 0.05, stage_progress: 1, message: "视频已上传，正在读取本地预览", download_url: null });
     setError(null);
   }
 
@@ -82,7 +82,7 @@ export default function Home() {
 
     const rect = selection.videoRect;
     setError(null);
-    setProgress({ status: "uploaded", progress: 0.08, message: "任务已提交", download_url: null });
+    setProgress({ status: "upload", progress: 0.08, stage_progress: 1, message: "任务已提交", download_url: null });
 
     const response = await fetch(`${API_BASE_URL}/api/process`, {
       method: "POST",
@@ -99,13 +99,25 @@ export default function Home() {
         video_width: video.width,
         video_height: video.height,
         inpaint_strength: options.inpaint_strength,
+        repair_mode: options.repair_mode,
+        detection_sensitivity: options.detection_sensitivity,
+        temporal_window: options.temporal_window,
+        min_component_area: options.min_component_area,
+        max_component_area: options.max_component_area,
         mask_dilate: options.mask_dilate,
         feather_radius: options.feather_radius,
+        ocr_confirm: options.ocr_confirm,
         keep_audio: options.keep_audio,
         options: {
           inpaint_strength: options.inpaint_strength,
+          repair_mode: options.repair_mode,
+          detection_sensitivity: options.detection_sensitivity,
+          temporal_window: options.temporal_window,
+          min_component_area: options.min_component_area,
+          max_component_area: options.max_component_area,
           mask_dilate: options.mask_dilate,
           feather_radius: options.feather_radius,
+          ocr_confirm: options.ocr_confirm,
           keep_audio: options.keep_audio,
           inpaint_radius: STRENGTH_TO_RADIUS[options.inpaint_strength]
         }
@@ -122,6 +134,7 @@ export default function Home() {
     setProgress({
       status: payload.status ?? "uploaded",
       progress: 0.1,
+      stage_progress: 0,
       message: "后端已接收处理任务",
       download_url: null
     });
