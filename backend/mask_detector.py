@@ -73,16 +73,18 @@ def detect_subtitle_mask(
             cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size)),
             iterations=1,
         )
-        component_mask = _limit_dilate_growth(component_mask, raw_mask, max_coverage=0.45)
+        component_mask = _limit_dilate_growth(component_mask, raw_mask, max_coverage=0.28)
         boxes = _boxes_from_mask(component_mask, min_component_area, max_component_area)
 
     coverage = _coverage(component_mask)
     warning: str | None = None
-    if coverage > 0.45:
+    if coverage > 0.32:
         component_mask = _shrink_large_mask(component_mask)
         boxes = _boxes_from_mask(component_mask, min_component_area, max_component_area)
         coverage = _coverage(component_mask)
-        warning = "mask_too_large_auto_shrunk"
+        warning = "当前 mask 过大，可能导致画面模糊，请降低强度或缩小框选范围。"
+    elif coverage > 0.25:
+        warning = "当前 mask 过大，可能导致画面模糊，请降低强度或缩小框选范围。"
     elif coverage < 0.01:
         retry_mask = _build_raw_text_mask(roi, min(1.0, sensitivity + 0.2))
         retry_mask = _morphology_cleanup(retry_mask, min(1.0, sensitivity + 0.2))
@@ -95,7 +97,8 @@ def detect_subtitle_mask(
             component_mask = retry_mask
             boxes = retry_boxes
             coverage = _coverage(component_mask)
-        warning = "low_mask_coverage"
+        if coverage < 0.01:
+            warning = "字幕识别不足，请提高强度或重新框选。"
 
     soft_mask = feather_mask(component_mask, feather_radius)
     debug_overlay = draw_debug_overlay(frame, (x, y, w, h), component_mask, boxes)

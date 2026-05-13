@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { DisplayRect, RepairPreview, VideoRect } from "./VideoAnnotator";
 import type { UploadedVideo } from "./VideoUploader";
 
@@ -34,7 +34,7 @@ export type ProgressState = {
   updated_at?: number;
 };
 
-type ProgressStage =
+export type ProgressStage =
   | "uploaded"
   | "probing"
   | "detecting_masks"
@@ -55,14 +55,36 @@ export type MaskPreview = {
   warning: string | null;
 };
 
+export type AutoDetectResult = {
+  recommended_rect: VideoRect;
+  confidence: number;
+  sample_frames: Array<{ frame_index: number; time: number; preview_url?: string; detected: boolean }>;
+  reason: string;
+  warning: string | null;
+};
+
+export type WorkflowMode = "smart" | "manual";
+type StrengthPreset = "light" | "standard" | "strong";
+type QualityPreset = "speed" | "balanced" | "quality";
+
 type EngineStatus = {
   requested_mode: string;
   actual_engine: string;
   capabilities: {
+    gpu_api?: { enabled: boolean; configured: boolean; url: string };
     propainter: { enabled: boolean; configured: boolean; path: string; device: string };
     lama: { enabled: boolean; configured: boolean; path: string; device: string };
     fallback_engine: string;
   };
+};
+
+type AdvancedOptions = {
+  detection_sensitivity: number;
+  min_component_area: number;
+  max_component_area: number;
+  mask_dilate: number;
+  feather_radius: number;
+  temporal_window: number;
 };
 
 type Props = {
@@ -73,14 +95,60 @@ type Props = {
   currentTime: number;
   maskPreview: MaskPreview | null;
   repairPreview: RepairPreview | null;
+  autoDetectResult: AutoDetectResult | null;
+  isAutoDetecting: boolean;
+  workflowMode: WorkflowMode;
   jobId: string | null;
   progress: ProgressState | null;
   onProgress: (progress: ProgressState | null) => void;
+  onWorkflowModeChange: (mode: WorkflowMode) => void;
+  onAutoDetect: () => Promise<void>;
   onStart: (options: ProcessOptions) => Promise<void>;
   onCancel: (jobId: string) => Promise<void>;
-  onPreviewMask: (options: ProcessOptions) => Promise<void>;
-  onPreviewRepair: (options: ProcessOptions) => Promise<void>;
+  onPreviewEffect: (options: ProcessOptions) => Promise<void>;
   onError: (message: string | null) => void;
+};
+
+const STRENGTH_PRESETS: Record<StrengthPreset, AdvancedOptions & { label: string; description: string; inpaint_strength: "low" | "medium" | "high" }> = {
+  light: {
+    label: "轻度",
+    description: "画面最自然，可能少量残留",
+    detection_sensitivity: 0.68,
+    mask_dilate: 3,
+    temporal_window: 2,
+    feather_radius: 8,
+    min_component_area: 4,
+    max_component_area: 5000,
+    inpaint_strength: "low"
+  },
+  standard: {
+    label: "标准",
+    description: "默认推荐，干净度和自然度平衡",
+    detection_sensitivity: 0.76,
+    mask_dilate: 4,
+    temporal_window: 3,
+    feather_radius: 10,
+    min_component_area: 4,
+    max_component_area: 5000,
+    inpaint_strength: "medium"
+  },
+  strong: {
+    label: "强力",
+    description: "字幕去得更干净，画面更容易糊",
+    detection_sensitivity: 0.84,
+    mask_dilate: 6,
+    temporal_window: 3,
+    feather_radius: 14,
+    min_component_area: 3,
+    max_component_area: 6500,
+    inpaint_strength: "high"
+  }
+};
+
+const QUALITY_PRESETS: Record<QualityPreset, { label: string; mode: ProcessOptions["repair_mode"]; description: string }> = {
+  speed: { label: "速度优先", mode: "fast", description: "快速预览，小视频更快出结果" },
+  balanced: { label: "平衡", mode: "balanced", description: "默认推荐，CPU 环境稳定可用" },
+  quality: { label: "效果优先", mode: "high_quality", description: "优先使用 GPU/模型能力，不可用则自动降级" }
 };
 
 export function ProcessingPanel({
@@ -91,29 +159,23 @@ export function ProcessingPanel({
   currentTime,
   maskPreview,
   repairPreview,
+  autoDetectResult,
+  isAutoDetecting,
+  workflowMode,
   jobId,
   progress,
   onProgress,
+  onWorkflowModeChange,
+  onAutoDetect,
   onStart,
   onCancel,
-  onPreviewMask,
-  onPreviewRepair,
+  onPreviewEffect,
   onError
 }: Props) {
-  const [options, setOptions] = useState<ProcessOptions>({
-    repair_mode: "balanced",
-    inpaint_strength: "medium",
-    detection_sensitivity: 0.62,
-    min_component_area: 4,
-    max_component_area: 5000,
-    mask_dilate: 4,
-    feather_radius: 4,
-    temporal_window: 3,
-    use_neighbor_frames: true,
-    preserve_edges: true,
-    keep_audio: true,
-    method: "TELEA"
-  });
+  const [strength, setStrength] = useState<StrengthPreset>("standard");
+  const [quality, setQuality] = useState<QualityPreset>("balanced");
+  const [advanced, setAdvanced] = useState<AdvancedOptions>(STRENGTH_PRESETS.standard);
+  const [useAdvanced, setUseAdvanced] = useState(false);
   const [engineStatus, setEngineStatus] = useState<EngineStatus | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isPreviewing, setIsPreviewing] = useState(false);
@@ -121,6 +183,14 @@ export function ProcessingPanel({
   const [pollMessage, setPollMessage] = useState<string | null>(null);
   const [lastProgressAt, setLastProgressAt] = useState<number | null>(null);
   const [clock, setClock] = useState(Date.now());
+
+  const options = useMemo(() => buildOptions(strength, quality, useAdvanced ? advanced : null), [advanced, quality, strength, useAdvanced]);
+
+  useEffect(() => {
+    if (!useAdvanced) {
+      setAdvanced(STRENGTH_PRESETS[strength]);
+    }
+  }, [strength, useAdvanced]);
 
   useEffect(() => {
     let active = true;
@@ -185,15 +255,11 @@ export function ProcessingPanel({
           return;
         }
         scheduleNextPoll(900);
-      } catch (error) {
+      } catch {
         if (isActive) {
           failureCount += 1;
           setPollFailureCount(failureCount);
-          setPollMessage(
-            failureCount <= 3
-              ? "正在重新连接进度..."
-              : "进度连接不稳定，但任务可能仍在运行"
-          );
+          setPollMessage(failureCount <= 3 ? "正在重新连接进度..." : "进度连接不稳定，但任务可能仍在运行");
           scheduleNextPoll(Math.min(3500, 900 + failureCount * 400));
         }
       } finally {
@@ -219,6 +285,27 @@ export function ProcessingPanel({
     return () => window.clearInterval(timer);
   }, []);
 
+  async function runAutoDetect() {
+    onError(null);
+    try {
+      await onAutoDetect();
+    } catch (error) {
+      onError(error instanceof Error ? error.message : "自动识别字幕区域失败");
+    }
+  }
+
+  async function runPreviewEffect() {
+    setIsPreviewing(true);
+    onError(null);
+    try {
+      await onPreviewEffect(options);
+    } catch (error) {
+      onError(error instanceof Error ? error.message : "预览效果失败");
+    } finally {
+      setIsPreviewing(false);
+    }
+  }
+
   async function handleStart() {
     setIsSubmitting(true);
     onError(null);
@@ -228,22 +315,6 @@ export function ProcessingPanel({
       onError(error instanceof Error ? error.message : "处理任务提交失败");
     } finally {
       setIsSubmitting(false);
-    }
-  }
-
-  async function runPreview(kind: "mask" | "repair") {
-    setIsPreviewing(true);
-    onError(null);
-    try {
-      if (kind === "mask") {
-        await onPreviewMask(options);
-      } else {
-        await onPreviewRepair(options);
-      }
-    } catch (error) {
-      onError(error instanceof Error ? error.message : "预览失败");
-    } finally {
-      setIsPreviewing(false);
     }
   }
 
@@ -265,118 +336,80 @@ export function ProcessingPanel({
   const canProcess = Boolean(video && videoRect && videoRect.width > 0 && videoRect.height > 0);
   const isProcessing = Boolean(jobId && progress?.status === "processing");
   const actualEngine = progress?.engine || engineStatus?.actual_engine || "Temporal OpenCV";
+  const engineHint = getEngineHint(options.repair_mode, actualEngine, engineStatus);
   const frameText = frameProgressText(progress);
   const lastUpdateText = lastProgressAt ? formatLastUpdated(lastProgressAt, clock) : "-";
 
   return (
     <div className="control-stack">
-      <section className="tool-card engine-card">
+      <section className="tool-card one-click-card">
         <div className="card-title">
-          <span>引擎状态</span>
+          <span>一键去字幕</span>
           <small>{actualEngine}</small>
         </div>
-        <div className="engine-pill-row">
-          <span className={options.repair_mode === "fast" ? "active" : ""}>fast</span>
-          <span className={options.repair_mode === "balanced" ? "active" : ""}>balanced</span>
-          <span className={options.repair_mode === "high_quality" ? "active" : ""}>high_quality</span>
+        <p className="hint">{engineHint}</p>
+
+        <div className="mode-switch">
+          <button type="button" className={workflowMode === "smart" ? "active" : ""} onClick={() => onWorkflowModeChange("smart")}>
+            智能全消
+            <small>自动识别常规字幕</small>
+          </button>
+          <button type="button" className={workflowMode === "manual" ? "active" : ""} onClick={() => onWorkflowModeChange("manual")}>
+            手动框选
+            <small>适合复杂画面</small>
+          </button>
         </div>
-        <p className="hint">
-          {engineStatus?.capabilities.propainter.enabled
-            ? "ProPainter 已启用。"
-            : "当前服务器未启用 ProPainter，高质量模式将使用 LaMa 或 Temporal OpenCV fallback。"}
-        </p>
+
+        <div className="choice-section">
+          <strong>去除强度</strong>
+          <div className="choice-grid">
+            {(["light", "standard", "strong"] as const).map((value) => (
+              <button key={value} type="button" className={strength === value ? "choice-button active" : "choice-button"} onClick={() => setStrength(value)}>
+                <span>{STRENGTH_PRESETS[value].label}</span>
+                <small>{STRENGTH_PRESETS[value].description}</small>
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="choice-section">
+          <strong>处理偏好</strong>
+          <div className="choice-grid">
+            {(["speed", "balanced", "quality"] as const).map((value) => (
+              <button key={value} type="button" className={quality === value ? "choice-button active" : "choice-button"} onClick={() => setQuality(value)}>
+                <span>{QUALITY_PRESETS[value].label}</span>
+                <small>{QUALITY_PRESETS[value].description}</small>
+              </button>
+            ))}
+          </div>
+        </div>
       </section>
 
-      <details className="tool-card" open>
-        <summary>文件信息</summary>
-        <InfoGrid
-          items={[
-            ["文件名", video?.filename ?? "-"],
-            ["文件大小", video ? formatBytes(video.fileSize) : "-"],
-            ["分辨率", video ? `${video.width} × ${video.height}` : "-"],
-            ["时长", video ? formatTime(video.duration) : "-"],
-            ["当前时间", formatTime(currentTime)]
-          ]}
-        />
-      </details>
-
-      <details className="tool-card" open>
-        <summary>字幕区域</summary>
-        <div className="coord-section">
-          <strong>屏幕显示坐标</strong>
-          <CoordGrid rect={displayRect} />
-        </div>
-        <div className="coord-section">
-          <strong>真实视频坐标</strong>
-          <CoordGrid rect={videoRect} />
-        </div>
-      </details>
-
-      <details className="tool-card" open>
-        <summary>检测参数</summary>
-        <RangeField label="检测敏感度" value={options.detection_sensitivity} min={0.15} max={1} step={0.01} onChange={(value) => setOptions({ ...options, detection_sensitivity: value })} />
-        <NumberField label="最小组件面积" value={options.min_component_area} min={1} max={10000} onChange={(value) => setOptions({ ...options, min_component_area: value })} />
-        <NumberField label="最大组件面积" value={options.max_component_area} min={4} max={250000} onChange={(value) => setOptions({ ...options, max_component_area: value })} />
-        <RangeField label="遮罩扩张" value={options.mask_dilate} min={0} max={30} step={1} onChange={(value) => setOptions({ ...options, mask_dilate: value })} />
-      </details>
-
-      <details className="tool-card" open>
-        <summary>修复参数</summary>
-        <label className="field">
-          <span>修复模式</span>
-          <div className="segmented three">
-            {(["fast", "balanced", "high_quality"] as const).map((value) => (
-              <button key={value} type="button" className={options.repair_mode === value ? "active" : ""} onClick={() => setOptions({ ...options, repair_mode: value })}>
-                {value}
-              </button>
-            ))}
-          </div>
-        </label>
-        <label className="field">
-          <span>修复强度</span>
-          <div className="segmented">
-            {(["low", "medium", "high"] as const).map((value) => (
-              <button key={value} type="button" className={options.inpaint_strength === value ? "active" : ""} onClick={() => setOptions({ ...options, inpaint_strength: value })}>
-                {value === "low" ? "低" : value === "medium" ? "中" : "高"}
-              </button>
-            ))}
-          </div>
-        </label>
-        <RangeField label="边缘羽化" value={options.feather_radius} min={0} max={20} step={1} onChange={(value) => setOptions({ ...options, feather_radius: value })} />
-        <RangeField label="时序窗口" value={options.temporal_window} min={0} max={8} step={1} onChange={(value) => setOptions({ ...options, temporal_window: value })} />
-        <SwitchField label="使用前后帧" checked={options.use_neighbor_frames} onChange={(value) => setOptions({ ...options, use_neighbor_frames: value })} />
-        <SwitchField label="保留边缘" checked={options.preserve_edges} onChange={(value) => setOptions({ ...options, preserve_edges: value })} />
-        <SwitchField label="保留原音频" checked={options.keep_audio} onChange={(value) => setOptions({ ...options, keep_audio: value })} />
-      </details>
-
-      <details className="tool-card" open>
-        <summary>预览工具</summary>
-        <div className="action-grid two">
-          <button type="button" className="ghost-button" disabled={!canProcess || isPreviewing} onClick={() => runPreview("mask")}>
-            预览 mask
-          </button>
-          <button type="button" className="ghost-button" disabled={!canProcess || isPreviewing} onClick={() => runPreview("repair")}>
-            预览当前帧修复
-          </button>
-        </div>
-        <InfoGrid
-          items={[
-            ["Mask 覆盖率", maskPreview ? `${(maskPreview.mask_coverage * 100).toFixed(2)}%` : "-"],
-            ["组件数量", maskPreview ? String(maskPreview.components_count) : "-"],
-            ["Mask 警告", maskPreview?.warning ?? "-"],
-            ["帧预览引擎", repairPreview?.engine ?? "-"]
-          ]}
-        />
-      </details>
-
-      <section className="tool-card">
+      <section className="tool-card steps-card">
         <div className="card-title">
-          <span>操作</span>
-          <small>{stage ? stepLabel(stage) : "等待处理"}</small>
+          <span>处理流程</span>
+          <small>{progress?.status ?? "idle"}</small>
         </div>
+        <StepItem index={1} title="上传视频" state={video ? "done" : "active"} detail={video?.filename ?? "选择 mp4、mov 或 webm"} />
+        <StepItem
+          index={2}
+          title="识别字幕"
+          state={autoDetectResult ? "done" : isAutoDetecting ? "active" : video ? "active" : "idle"}
+          detail={autoDetectResult ? `置信度 ${Math.round(autoDetectResult.confidence * 100)}%` : isAutoDetecting ? "正在自动分析字幕位置" : "上传后自动开始"}
+        />
+        <StepItem index={3} title="预览效果" state={repairPreview ? "done" : maskPreview ? "active" : "idle"} detail={maskPreview ? `mask ${(maskPreview.mask_coverage * 100).toFixed(1)}% · ${maskPreview.components_count} 个组件` : "先查看将被擦除的像素"} />
+        <StepItem index={4} title="开始处理" state={isProcessing ? "active" : isCompleteStatus(progress?.status ?? "idle") ? "done" : "idle"} detail={stage ? stepLabel(stage) : "生成完整视频"} />
+        <StepItem index={5} title="下载结果" state={downloadUrl ? "done" : "idle"} detail={downloadUrl ? "结果已生成" : "完成后下载 mp4"} />
+
         <div className="action-grid">
+          <button type="button" className="ghost-button" disabled={!video || isAutoDetecting} onClick={runAutoDetect}>
+            {isAutoDetecting ? "识别中" : "自动识别字幕"}
+          </button>
+          <button type="button" className="ghost-button" disabled={!canProcess || isPreviewing} onClick={runPreviewEffect}>
+            {isPreviewing ? "预览中" : "预览效果"}
+          </button>
           <button type="button" className="primary-button" disabled={!canProcess || isSubmitting || isProcessing} onClick={handleStart}>
-            {isSubmitting ? "提交中" : "开始处理"}
+            {isSubmitting ? "提交中" : "开始去字幕"}
           </button>
           <button type="button" className="danger-button" disabled={!isProcessing} onClick={handleCancel}>
             取消
@@ -389,47 +422,107 @@ export function ProcessingPanel({
 
       <section className="tool-card progress-panel">
         <div className="card-title">
-          <span>任务进度</span>
+          <span>状态反馈</span>
           <small>{percentage}%</small>
         </div>
         <div className="progress-track">
           <div className="progress-fill" style={{ width: `${percentage}%` }} />
         </div>
-        {pollMessage ? (
-          <div className={`poll-warning ${pollFailureCount > 3 ? "unstable" : ""}`}>
-            {pollMessage}
-          </div>
-        ) : null}
+        {pollMessage ? <div className={`poll-warning ${pollFailureCount > 3 ? "unstable" : ""}`}>{pollMessage}</div> : null}
+        {autoDetectResult?.warning ? <div className="soft-warning">{autoDetectResult.warning}</div> : null}
+        {maskPreview?.warning ? <div className="soft-warning">{maskPreview.warning}</div> : null}
         <InfoGrid
           items={[
             ["当前步骤", stage ? stepLabel(stage) : "-"],
-            ["任务状态", progress?.status ?? "idle"],
             ["当前帧", frameText],
-            ["实际引擎", actualEngine],
             ["最后更新", lastUpdateText],
-            ["后端信息", progress?.message ?? "等待开始处理"],
+            ["后端信息", progress?.message ?? autoDetectResult?.reason ?? "等待开始处理"],
             ["错误信息", progress?.error ?? "-"]
           ]}
         />
       </section>
+
+      <details className="tool-card">
+        <summary>文件与字幕区域</summary>
+        <InfoGrid
+          items={[
+            ["文件名", video?.filename ?? "-"],
+            ["文件大小", video ? formatBytes(video.fileSize) : "-"],
+            ["分辨率", video ? `${video.width} × ${video.height}` : "-"],
+            ["时长", video ? formatTime(video.duration) : "-"],
+            ["自动识别", autoDetectResult ? `${Math.round(autoDetectResult.confidence * 100)}%` : "-"],
+            ["当前时间", formatTime(currentTime)]
+          ]}
+        />
+        <div className="coord-section">
+          <strong>屏幕显示坐标</strong>
+          <CoordGrid rect={displayRect} />
+        </div>
+        <div className="coord-section">
+          <strong>真实视频坐标</strong>
+          <CoordGrid rect={videoRect} />
+        </div>
+      </details>
+
+      <details className="tool-card">
+        <summary>高级设置</summary>
+        <SwitchField label="启用高级参数覆盖" checked={useAdvanced} onChange={setUseAdvanced} />
+        <RangeField label="检测灵敏度" value={advanced.detection_sensitivity} min={0.15} max={1} step={0.01} disabled={!useAdvanced} onChange={(value) => setAdvanced({ ...advanced, detection_sensitivity: value })} />
+        <RangeField label="时间窗口" value={advanced.temporal_window} min={0} max={8} step={1} disabled={!useAdvanced} onChange={(value) => setAdvanced({ ...advanced, temporal_window: value })} />
+        <RangeField label="mask 扩张" value={advanced.mask_dilate} min={0} max={30} step={1} disabled={!useAdvanced} onChange={(value) => setAdvanced({ ...advanced, mask_dilate: value })} />
+        <RangeField label="feather" value={advanced.feather_radius} min={0} max={20} step={1} disabled={!useAdvanced} onChange={(value) => setAdvanced({ ...advanced, feather_radius: value })} />
+        <NumberField label="min component area" value={advanced.min_component_area} min={1} max={10000} disabled={!useAdvanced} onChange={(value) => setAdvanced({ ...advanced, min_component_area: value })} />
+        <NumberField label="max component area" value={advanced.max_component_area} min={4} max={250000} disabled={!useAdvanced} onChange={(value) => setAdvanced({ ...advanced, max_component_area: value })} />
+      </details>
     </div>
   );
 }
 
-function RangeField({ label, value, min, max, step, onChange }: { label: string; value: number; min: number; max: number; step: number; onChange: (value: number) => void }) {
+function buildOptions(strength: StrengthPreset, quality: QualityPreset, advanced: AdvancedOptions | null): ProcessOptions {
+  const strengthPreset = STRENGTH_PRESETS[strength];
+  const tuning = advanced ?? strengthPreset;
+  return {
+    repair_mode: QUALITY_PRESETS[quality].mode,
+    inpaint_strength: strengthPreset.inpaint_strength,
+    detection_sensitivity: tuning.detection_sensitivity,
+    min_component_area: tuning.min_component_area,
+    max_component_area: tuning.max_component_area,
+    mask_dilate: tuning.mask_dilate,
+    feather_radius: tuning.feather_radius,
+    temporal_window: tuning.temporal_window,
+    use_neighbor_frames: quality !== "speed",
+    preserve_edges: true,
+    keep_audio: true,
+    method: "TELEA"
+  };
+}
+
+function StepItem({ index, title, detail, state }: { index: number; title: string; detail: string; state: "idle" | "active" | "done" }) {
+  return (
+    <div className={`step-item ${state}`}>
+      <span>{state === "done" ? "✓" : index}</span>
+      <div>
+        <strong>{title}</strong>
+        <small>{detail}</small>
+      </div>
+    </div>
+  );
+}
+
+function RangeField({ label, value, min, max, step, disabled, onChange }: { label: string; value: number; min: number; max: number; step: number; disabled?: boolean; onChange: (value: number) => void }) {
   return (
     <label className="field">
       <span>{label}：{typeof value === "number" && step < 1 ? value.toFixed(2) : value}</span>
-      <input type="range" min={min} max={max} step={step} value={value} onChange={(event) => onChange(Number(event.target.value))} />
+      <input type="range" min={min} max={max} step={step} value={value} disabled={disabled} onChange={(event) => onChange(Number(event.target.value))} />
     </label>
   );
 }
 
-function NumberField({ label, value, min, max, onChange }: { label: string; value: number; min: number; max: number; onChange: (value: number) => void }) {
+function NumberField({ label, value, min, max, disabled, onChange }: { label: string; value: number; min: number; max: number; disabled?: boolean; onChange: (value: number) => void }) {
   return (
     <label className="field">
       <span>{label}</span>
-      <input className="number-input" type="number" min={min} max={max} value={value} onChange={(event) => onChange(Number(event.target.value))} />
+      <input className="number-input" type="number" min={min} max={max} value={value} disabled={disabled} onChange={(event) => onChange(Number(event.target.value))} />
     </label>
   );
 }
@@ -476,6 +569,19 @@ function Coord({ label, value }: { label: string; value: number | undefined }) {
   );
 }
 
+function getEngineHint(mode: ProcessOptions["repair_mode"], engine: string, status: EngineStatus | null) {
+  if (mode === "high_quality" && engine === "Temporal OpenCV") {
+    return "当前服务器未启用 GPU 高质量引擎，正在使用 Temporal OpenCV。想要更干净效果，需要启用 ProPainter、LaMa 或 GPU API。";
+  }
+  if (status?.capabilities.gpu_api?.enabled) {
+    return "GPU API 已配置，高质量模式会优先尝试外部 GPU 引擎。";
+  }
+  if (engine === "OpenCV") {
+    return "速度优先模式使用 OpenCV，适合快速预览。";
+  }
+  return "默认使用 CPU 增强处理：文字级 mask、前后帧融合和边缘收口。";
+}
+
 function getProgressStage(progress: ProgressState | null): ProgressStage | undefined {
   return progress?.stage ?? progress?.step;
 }
@@ -506,7 +612,7 @@ function formatLastUpdated(lastProgressAt: number, now: number) {
 
 function stepLabel(step: ProgressStage) {
   const labels: Record<ProgressStage, string> = {
-    uploaded: "读取视频",
+    uploaded: "上传完成",
     probing: "读取视频",
     detecting_masks: "生成字幕 mask",
     extracting_frames: "拆帧",

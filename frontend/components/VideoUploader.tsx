@@ -62,7 +62,7 @@ export function VideoUploader({ apiBaseUrl, video, onUploaded }: Props) {
         fileSize: selectedFile.size,
         mimeType: selectedFile.type
       });
-      setMessage("上传完成，可以框选字幕区域");
+      setMessage("上传完成，正在自动识别字幕区域");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "上传失败");
     } finally {

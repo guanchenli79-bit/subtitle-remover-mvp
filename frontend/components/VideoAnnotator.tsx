@@ -29,13 +29,16 @@ type Props = {
   outputUrl: string | null;
   maskPreviewUrl: string | null;
   showMaskOverlay: boolean;
+  maskDisplayMode: "overlay" | "mask";
   repairPreview: RepairPreview | null;
   displayRect: DisplayRect | null;
   videoRect: VideoRect | null;
+  autoRect: VideoRect | null;
   onSelectionChange: (displayRect: DisplayRect | null, videoRect: VideoRect | null) => void;
   onVideoMetadata: (metadata: VideoMetadata) => void;
   onTimeChange: (time: number) => void;
   onToggleMaskOverlay: () => void;
+  onMaskDisplayModeChange: (mode: "overlay" | "mask") => void;
 };
 
 export type RepairPreview = {
@@ -63,13 +66,16 @@ export function VideoAnnotator({
   outputUrl,
   maskPreviewUrl,
   showMaskOverlay,
+  maskDisplayMode,
   repairPreview,
   displayRect,
   videoRect,
+  autoRect,
   onSelectionChange,
   onVideoMetadata,
   onTimeChange,
-  onToggleMaskOverlay
+  onToggleMaskOverlay,
+  onMaskDisplayModeChange
 }: Props) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const [interaction, setInteraction] = useState<Interaction | null>(null);
@@ -78,6 +84,7 @@ export function VideoAnnotator({
   const [isPlaying, setIsPlaying] = useState(false);
   const [checkpointTime, setCheckpointTime] = useState(0);
   const [comparisonPosition, setComparisonPosition] = useState(50);
+  const [metadataReadyKey, setMetadataReadyKey] = useState(0);
 
   const naturalWidth = video.width || 16;
   const naturalHeight = video.height || 9;
@@ -92,6 +99,15 @@ export function VideoAnnotator({
     setIsPlaying(false);
     setCheckpointTime(0);
   }, [video.video_id, video.duration]);
+
+  useEffect(() => {
+    const element = videoRef.current;
+    if (!autoRect || !element || element.videoWidth <= 0 || element.videoHeight <= 0) {
+      return;
+    }
+    const nextDisplayRect = videoRectToDisplayRect(autoRect, element);
+    onSelectionChange(nextDisplayRect, autoRect);
+  }, [autoRect?.x, autoRect?.y, autoRect?.width, autoRect?.height, metadataReadyKey, video.video_id]);
 
   const timeLabel = useMemo(() => {
     return `${formatTime(currentTime)} / ${formatTime(duration)}`;
@@ -124,6 +140,7 @@ export function VideoAnnotator({
       duration: element.duration || 0
     };
     setDuration(metadata.duration);
+    setMetadataReadyKey((value) => value + 1);
     onVideoMetadata(metadata);
   }
 
@@ -247,7 +264,7 @@ export function VideoAnnotator({
       </div>
 
       <div className="video-canvas-shell">
-        <div className="video-frame" style={{ aspectRatio, maxWidth: maxFrameWidth }}>
+        <div className={`video-frame ${maskPreviewUrl && showMaskOverlay && maskDisplayMode === "mask" ? "mask-only" : ""}`} style={{ aspectRatio, maxWidth: maxFrameWidth }}>
           <video
             ref={videoRef}
             className="preview-video"
@@ -267,6 +284,9 @@ export function VideoAnnotator({
             onPointerUp={handlePointerUp}
             onPointerCancel={() => setInteraction(null)}
           >
+            {maskPreviewUrl && showMaskOverlay ? (
+              <img className={`mask-preview-overlay ${maskDisplayMode}`} src={maskPreviewUrl} alt="mask preview overlay" />
+            ) : null}
             {activeRect ? (
               <div className="selection-box" style={rectStyle(activeRect)}>
                 <span className="selection-label">字幕区域</span>
@@ -275,9 +295,6 @@ export function VideoAnnotator({
                 <span className="resize-handle sw" data-handle="sw" />
                 <span className="resize-handle se" data-handle="se" />
               </div>
-            ) : null}
-            {maskPreviewUrl && showMaskOverlay ? (
-              <img className="mask-preview-overlay" src={maskPreviewUrl} alt="mask preview overlay" />
             ) : null}
           </div>
         </div>
@@ -300,7 +317,10 @@ export function VideoAnnotator({
           下一帧
         </button>
         <button type="button" className={`control-button ${showMaskOverlay ? "active" : ""}`} onClick={onToggleMaskOverlay}>
-          Mask 叠加
+          显示 mask
+        </button>
+        <button type="button" className={`control-button ${maskDisplayMode === "mask" ? "active" : ""}`} onClick={() => onMaskDisplayModeChange(maskDisplayMode === "overlay" ? "mask" : "overlay")}>
+          {maskDisplayMode === "overlay" ? "叠加显示" : "仅显示 mask"}
         </button>
         <span className="time-readout">{timeLabel}</span>
         <input
@@ -393,6 +413,40 @@ export function displayRectToVideoRect(displayRect: DisplayRect, videoElement: H
     y: clampInt(y, 0, videoHeight),
     width: clampInt(width, 0, videoWidth - x),
     height: clampInt(height, 0, videoHeight - y)
+  };
+}
+
+export function videoRectToDisplayRect(videoRect: VideoRect, videoElement: HTMLVideoElement): DisplayRect {
+  const videoWidth = videoElement.videoWidth;
+  const videoHeight = videoElement.videoHeight;
+  const bounds = videoElement.getBoundingClientRect();
+
+  if (videoWidth <= 0 || videoHeight <= 0 || bounds.width <= 0 || bounds.height <= 0) {
+    return { x: 0, y: 0, width: 0, height: 0 };
+  }
+
+  const videoAspect = videoWidth / videoHeight;
+  const boundsAspect = bounds.width / bounds.height;
+  let displayedWidth = bounds.width;
+  let displayedHeight = bounds.height;
+  let offsetX = 0;
+  let offsetY = 0;
+
+  if (boundsAspect > videoAspect) {
+    displayedHeight = bounds.height;
+    displayedWidth = displayedHeight * videoAspect;
+    offsetX = (bounds.width - displayedWidth) / 2;
+  } else {
+    displayedWidth = bounds.width;
+    displayedHeight = displayedWidth / videoAspect;
+    offsetY = (bounds.height - displayedHeight) / 2;
+  }
+
+  return {
+    x: Math.round(offsetX + (videoRect.x / videoWidth) * displayedWidth),
+    y: Math.round(offsetY + (videoRect.y / videoHeight) * displayedHeight),
+    width: Math.round((videoRect.width / videoWidth) * displayedWidth),
+    height: Math.round((videoRect.height / videoHeight) * displayedHeight)
   };
 }
 

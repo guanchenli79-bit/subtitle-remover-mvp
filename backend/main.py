@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 
 import jobs
 import storage
+from subtitle_region_detector import auto_detect_subtitle_region
 from video_processor import engine_status_for_mode, preview_mask, preview_repair_frame, probe_video, process_video
 
 
@@ -99,6 +100,11 @@ class PreviewRequest(ProcessRequest):
     time: float = Field(default=0.0, ge=0)
 
 
+class AutoDetectSubtitleRegionRequest(BaseModel):
+    video_id: str
+    sample_count: int = Field(default=10, ge=8, le=12)
+
+
 @app.on_event("startup")
 def on_startup() -> None:
     storage.ensure_dirs()
@@ -154,6 +160,16 @@ def preview_video(video_id: str) -> FileResponse:
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail="Video not found") from exc
     return FileResponse(path)
+
+
+@app.post("/api/auto-detect-subtitle-region")
+def auto_detect_subtitle_region_endpoint(request: AutoDetectSubtitleRegionRequest) -> dict:
+    try:
+        metadata = storage.read_video_metadata(request.video_id)
+        path = storage.get_upload_path(request.video_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Video not found") from exc
+    return auto_detect_subtitle_region(path, metadata, sample_count=request.sample_count)
 
 
 @app.post("/api/process")

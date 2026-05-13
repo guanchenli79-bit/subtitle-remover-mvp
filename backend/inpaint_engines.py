@@ -27,11 +27,18 @@ def get_engine_capabilities() -> dict:
     lama_model_path = Path(os.getenv("LAMA_MODEL_PATH", "/app/models/lama"))
     propainter_device = os.getenv("PROPAINTER_DEVICE", "cpu")
     lama_device = os.getenv("LAMA_DEVICE", "cpu")
+    gpu_api_url = os.getenv("GPU_API_URL", "").strip()
     propainter_device_available = propainter_device != "cuda" or shutil.which("nvidia-smi") is not None
     lama_device_available = lama_device != "cuda" or shutil.which("nvidia-smi") is not None
+    gpu_api_enabled = _truthy(os.getenv("ENABLE_GPU_API", "false")) and bool(gpu_api_url)
     propainter_enabled = _truthy(os.getenv("ENABLE_PROPAINTER", "false")) and propainter_path.exists() and propainter_device_available
     lama_enabled = _truthy(os.getenv("ENABLE_LAMA", "false")) and lama_model_path.exists() and lama_device_available
     return {
+        "gpu_api": {
+            "enabled": gpu_api_enabled,
+            "configured": _truthy(os.getenv("ENABLE_GPU_API", "false")),
+            "url": gpu_api_url,
+        },
         "propainter": {
             "enabled": propainter_enabled,
             "configured": _truthy(os.getenv("ENABLE_PROPAINTER", "false")),
@@ -58,6 +65,8 @@ def choose_engine(mode: str) -> str:
     if requested == "balanced":
         return "Temporal OpenCV"
     if requested == "high_quality":
+        if capabilities["gpu_api"]["enabled"]:
+            return "GPU API"
         if capabilities["propainter"]["enabled"]:
             return "ProPainter"
         if capabilities["lama"]["enabled"]:
@@ -80,6 +89,24 @@ def repair_video(
     progress_callback: ProgressCallback,
 ) -> EngineResult:
     engine = choose_engine(mode)
+    if engine == "GPU API":
+        try:
+            return _repair_with_gpu_api(
+                input_path=input_path,
+                output_path=output_path,
+                frames=frames,
+                mask_sequence=mask_sequence,
+                fps=fps,
+                keep_audio=keep_audio,
+                options=options,
+                work_dir=work_dir,
+                progress_callback=progress_callback,
+            )
+        except Exception as exc:
+            progress_callback("repairing_frames", 0.50, f"GPU API unavailable, falling back: {exc}")
+            capabilities = get_engine_capabilities()
+            engine = "ProPainter" if capabilities["propainter"]["enabled"] else "LaMa" if capabilities["lama"]["enabled"] else "Temporal OpenCV"
+
     if engine == "ProPainter":
         try:
             return _repair_with_propainter(
@@ -137,7 +164,7 @@ def repair_frame(
 ) -> tuple[np.ndarray, str]:
     opts = options or {}
     engine = choose_engine(mode)
-    if engine in {"ProPainter", "LaMa"}:
+    if engine in {"GPU API", "ProPainter", "LaMa"}:
         # The preview path intentionally uses the stable CPU fallback unless optional
         # model inference is explicitly wired for this deployment.
         engine = "Temporal OpenCV"
@@ -361,6 +388,53 @@ def _repair_with_propainter(
     progress_callback("muxing_audio", 0.92, "合成音频")
     mux_audio(input_path, silent_video, output_path, keep_audio=keep_audio)
     return EngineResult(engine="ProPainter", requested_mode="high_quality", output_path=output_path, message="completed with ProPainter")
+
+
+def _repair_with_gpu_api(
+    *,
+    input_path: Path,
+    output_path: Path,
+    frames: Sequence[np.ndarray],
+    mask_sequence: Sequence[np.ndarray],
+    fps: float,
+    keep_audio: bool,
+    options: dict,
+    work_dir: Path,
+    progress_callback: ProgressCallback,
+) -> EngineResult:
+    api_url = os.getenv("GPU_API_URL", "").strip()
+    api_key = os.getenv("GPU_API_KEY", "").strip()
+    if not api_url:
+        raise RuntimeError("GPU_API_URL is not configured")
+
+    # Adapter hook: deployments can replace this with an HTTP client that uploads
+    # input_path, mask frames, and options, then writes the returned mp4 to output_path.
+    masks_dir = work_dir / "gpu_api_masks"
+    masks_dir.mkdir(parents=True, exist_ok=True)
+    total = max(1, len(mask_sequence))
+    progress_callback("extracting_frames", 0.50, "准备 GPU API mask", current_frame=0, total_frames=total)
+    for index, mask in enumerate(mask_sequence):
+        cv2.imwrite(str(masks_dir / f"{index:06d}.png"), mask)
+        if index % 10 == 0 or index == len(mask_sequence) - 1:
+            progress_callback(
+                "extracting_frames",
+                0.50 + ((index + 1) / total) * 0.08,
+                f"准备 GPU API mask {index + 1}/{total}",
+                current_frame=index + 1,
+                total_frames=total,
+            )
+
+    manifest = {
+        "api_url": api_url,
+        "has_api_key": bool(api_key),
+        "input_path": str(input_path),
+        "masks_dir": str(masks_dir),
+        "fps": fps,
+        "keep_audio": keep_audio,
+        "options": options,
+    }
+    (work_dir / "gpu_api_payload.json").write_text(str(manifest), encoding="utf-8")
+    raise RuntimeError("GPU API adapter is reserved but not implemented in this deployment")
 
 
 def _repair_with_lama_fallback(

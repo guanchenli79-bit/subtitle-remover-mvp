@@ -1,6 +1,6 @@
 # 视频去字幕工具 MVP
 
-一个可部署到 Railway 的在线视频去字幕工具 MVP。用户上传视频后，在 HTML5 video 预览画面上框选字幕区域，后端生成文字级字幕 mask，并按 `fast / balanced / high_quality` 三档选择 OpenCV、Temporal OpenCV、ProPainter 或 LaMa fallback 修复，最后用 FFmpeg 合成 mp4 并保留原视频音频。
+一个可部署到 Railway 的在线视频去字幕工具 MVP。V5 将流程改成更接近一键工具：上传视频后自动分析字幕区域、自动框出推荐范围，用户可微调后预览效果，再开始完整去字幕处理。后端生成文字级字幕 mask，并按 `fast / balanced / high_quality` 三档选择 OpenCV、Temporal OpenCV、ProPainter、LaMa 或外部 GPU API fallback 修复，最后用 FFmpeg 合成 mp4 并保留原视频音频。
 
 ## 当前部署形态
 
@@ -21,6 +21,9 @@ frontend/
 backend/
   main.py
   video_processor.py
+  subtitle_region_detector.py
+  mask_detector.py
+  inpaint_engines.py
   storage.py
   jobs.py
   requirements.txt
@@ -44,17 +47,59 @@ PROPAINTER_DEVICE=cpu
 ENABLE_LAMA=false
 LAMA_MODEL_PATH=/app/models/lama
 LAMA_DEVICE=cpu
+ENABLE_GPU_API=false
+GPU_API_URL=
+GPU_API_KEY=
 ```
 
 单容器部署时 `NEXT_PUBLIC_API_BASE_URL` 留空，前端会请求同域名下的 `/api`。如果以后拆成前后端两个服务，再把它设成后端公网地址。
 
-## V4 修复模式
+## V5 一键流程
+
+默认用户流程：
+
+1. 上传视频。
+2. 前端自动调用 `POST /api/auto-detect-subtitle-region`。
+3. 页面显示推荐字幕区域和置信度。
+4. 用户选择「智能全消」或「手动框选」。
+5. 用户只需要选择「轻度 / 标准 / 强力」和「速度优先 / 平衡 / 效果优先」。
+6. 点击「预览效果」，系统先生成 mask，再生成当前帧 before/after。
+7. 点击「开始去字幕」。
+8. 完成后下载 mp4。
+
+简化强度会映射到内部参数：
+
+```text
+轻度：detection_sensitivity=0.68, mask_dilate=3, temporal_window=2, feather_radius=8
+标准：detection_sensitivity=0.76, mask_dilate=4, temporal_window=3, feather_radius=10
+强力：detection_sensitivity=0.84, mask_dilate=6, temporal_window=3, feather_radius=14
+```
+
+处理偏好映射：
+
+```text
+速度优先 = fast
+平衡 = balanced
+效果优先 = high_quality
+```
+
+高级参数仍保留在「高级设置」折叠区里，普通用户默认不需要打开。
+
+## 修复模式和引擎 fallback
 
 - `fast`：OpenCV inpaint，速度优先，适合快速预览。
 - `balanced`：默认模式，文字级 mask + 前后帧 Temporal OpenCV 融合 + OpenCV 边缘收口。
-- `high_quality`：优先 ProPainter；没有 ProPainter 时尝试 LaMa；二者不可用时自动 fallback 到 Temporal OpenCV。
+- `high_quality`：优先外部 GPU API；没有 GPU API 时尝试 ProPainter；没有 ProPainter 时尝试 LaMa；都不可用时自动 fallback 到 Temporal OpenCV。
 
-Railway 普通 CPU 环境默认不会下载或安装 ProPainter/LaMa 大模型，网站仍可启动并使用 `balanced`。如果要启用模型，需要自行把模型目录挂载或打包到镜像外部存储，并设置：
+Railway 默认是 CPU 模式，Dockerfile 不会强制下载任何大模型。CPU 模式下 `high_quality` 会 fallback 到 `Temporal OpenCV`，页面会明确提示：当前服务器未启用 GPU 高质量引擎，正在使用 Temporal OpenCV。
+
+要达到更接近商业级的干净效果，需要启用以下任一能力：
+
+- ProPainter 视频修复模型。
+- LaMa 单帧修复模型。
+- 外部 GPU API。
+
+如果要启用 ProPainter，需要自行把模型目录挂载或打包到镜像外部存储，并设置：
 
 ```bash
 ENABLE_PROPAINTER=true
@@ -70,16 +115,29 @@ LAMA_MODEL_PATH=/app/models/lama
 LAMA_DEVICE=cpu
 ```
 
-页面会显示当前实际使用的修复引擎：`ProPainter`、`LaMa`、`Temporal OpenCV` 或 `OpenCV`，不会在未启用模型时假装使用 ProPainter。
+如果要启用外部 GPU API：
 
-## 预览接口
+```bash
+ENABLE_GPU_API=true
+GPU_API_URL=https://your-gpu-service.example.com
+GPU_API_KEY=your-secret-key
+```
 
-V4 增加了两个轻量预览接口：
+当前仓库只提供 GPU API 的可插拔适配结构，不绑定任何第三方服务。启用后 `high_quality` 会优先尝试 GPU API；如果适配器不可用或调用失败，会继续 fallback 到 ProPainter、LaMa 或 Temporal OpenCV。
 
+页面会显示当前实际使用的修复引擎：`GPU API`、`ProPainter`、`LaMa`、`Temporal OpenCV` 或 `OpenCV`，不会在未启用模型时假装使用 ProPainter。
+
+## 主要接口
+
+- `POST /api/auto-detect-subtitle-region`：采样多帧，返回推荐字幕框、置信度、采样帧和提示。
 - `POST /api/preview-mask`：返回当前帧 mask overlay 图、mask 覆盖率、组件数量和 warning。
 - `POST /api/preview-repair-frame`：只修复当前时间点的一帧，返回 before / after 图片和实际预览引擎。
+- `GET /api/engine-status`：返回当前服务器引擎能力和实际 fallback。
+- `POST /api/process`：提交完整视频处理任务。
+- `GET /api/status/{job_id}`：轻量查询任务状态。
+- `GET /api/download/{job_id}`：下载处理后的 mp4。
 
-前端右侧「预览工具」里有 **预览 mask** 和 **预览当前帧修复** 两个按钮。
+前端「预览效果」会先调用 mask 预览，再调用当前帧修复预览。mask 覆盖率超过 25% 时会提示可能导致画面模糊；低于 1% 时会提示提高强度或重新框选。
 
 ## 本地 Docker 运行
 
@@ -131,11 +189,12 @@ https://your-service-name.up.railway.app
 1. 打开 Railway 生成的公网 URL。
 2. 点击 **上传视频**，选择一个较短的 `mp4`、`mov` 或 `webm`。
 3. 点击 **确认上传**。
-4. 视频预览出现后，在字幕位置拖拽出矩形框。
-5. 确认右侧显示 `X / Y / 宽 / 高` 坐标。
-6. 保持默认参数，点击 **开始去字幕处理**。
-7. 等待处理进度到 100%。
-8. 点击 **下载视频**，下载处理后的 mp4。
+4. 视频预览出现后，等待自动字幕区域识别完成。
+5. 如果推荐框不准，拖拽框选区域微调，或切换到 **手动框选**。
+6. 点击 **预览效果**，查看 mask 和当前帧 before/after。
+7. 保持 **标准 + 平衡**，点击 **开始去字幕**。
+8. 等待处理进度到 100%。
+9. 点击 **下载结果**，下载处理后的 mp4。
 
 建议先用 5 到 15 秒的小视频测试，确认 Railway 机器规格和处理速度符合预期。
 
@@ -184,5 +243,6 @@ NEXT_PUBLIC_API_BASE_URL=https://subtitle-backend.up.railway.app
 - 仅允许 `mp4`、`mov`、`webm`。
 - 任务进度保存在内存中，重启后会丢失。
 - 本地文件存储在容器文件系统内，Railway 重新部署后历史上传和输出文件不会保留。
-- V4 默认重点是文字级 mask + Temporal OpenCV；ProPainter/LaMa 为可选模型能力，不做复杂账号、付费或队列系统。
+- V5 默认重点是一键流程、自动字幕区域识别、文字级 mask + Temporal OpenCV；ProPainter/LaMa/GPU API 为可选高质量能力，不做复杂账号、付费或队列系统。
+- Railway CPU 环境可以稳定使用，但很难达到商业级模型效果。想要更干净的背景纹理和运动修复，建议接 ProPainter 或外部 GPU API。
 - 请只处理自己拥有版权或获得授权的视频。

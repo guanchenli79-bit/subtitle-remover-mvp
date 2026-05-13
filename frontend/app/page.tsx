@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { ProcessingPanel, type MaskPreview, type ProcessOptions, type ProgressState } from "../components/ProcessingPanel";
+import { ProcessingPanel, type AutoDetectResult, type MaskPreview, type ProcessOptions, type ProgressState, type WorkflowMode } from "../components/ProcessingPanel";
 import { VideoAnnotator, type DisplayRect, type RepairPreview, type VideoMetadata, type VideoRect } from "../components/VideoAnnotator";
 import { VideoUploader, type UploadedVideo } from "../components/VideoUploader";
 
@@ -17,7 +17,12 @@ export default function Home() {
   const [currentTime, setCurrentTime] = useState(0);
   const [maskPreview, setMaskPreview] = useState<MaskPreview | null>(null);
   const [repairPreview, setRepairPreview] = useState<RepairPreview | null>(null);
+  const [autoDetectResult, setAutoDetectResult] = useState<AutoDetectResult | null>(null);
+  const [autoRect, setAutoRect] = useState<VideoRect | null>(null);
+  const [isAutoDetecting, setIsAutoDetecting] = useState(false);
+  const [workflowMode, setWorkflowMode] = useState<WorkflowMode>("smart");
   const [showMaskOverlay, setShowMaskOverlay] = useState(true);
+  const [maskDisplayMode, setMaskDisplayMode] = useState<"overlay" | "mask">("overlay");
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -47,8 +52,15 @@ export default function Home() {
     setCurrentTime(0);
     setMaskPreview(null);
     setRepairPreview(null);
+    setAutoDetectResult(null);
+    setAutoRect(null);
+    setWorkflowMode("smart");
+    setMaskDisplayMode("overlay");
     setProgress({ status: "idle", step: "uploaded", progress: 0.02, message: "上传完成", download_url: null });
     setError(null);
+    void runAutoDetect(uploaded).catch((error) => {
+      setError(error instanceof Error ? error.message : "自动识别字幕区域失败");
+    });
   }
 
   function handleSelectionChange(nextDisplayRect: DisplayRect | null, nextVideoRect: VideoRect | null) {
@@ -71,7 +83,8 @@ export default function Home() {
   }
 
   async function startProcessing(options: ProcessOptions) {
-    if (!video || !videoRect) {
+    const rect = videoRect ?? autoDetectResult?.recommended_rect ?? null;
+    if (!video || !rect) {
       return;
     }
 
@@ -85,14 +98,14 @@ export default function Home() {
       },
       body: JSON.stringify({
         video_id: video.video_id,
-        x: videoRect.x,
-        y: videoRect.y,
-        width: videoRect.width,
-        height: videoRect.height,
+        x: rect.x,
+        y: rect.y,
+        width: rect.width,
+        height: rect.height,
         video_width: video.width,
         video_height: video.height,
         rect: {
-          ...videoRect,
+          ...rect,
           video_width: video.width,
           video_height: video.height
         },
@@ -125,13 +138,14 @@ export default function Home() {
   }
 
   async function previewMask(options: ProcessOptions) {
-    if (!video || !videoRect) {
+    const rect = videoRect ?? autoDetectResult?.recommended_rect ?? null;
+    if (!video || !rect) {
       return;
     }
     const response = await fetch(`${API_BASE_URL}/api/preview-mask`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(buildPreviewPayload(video, videoRect, currentTime, options))
+      body: JSON.stringify(buildPreviewPayload(video, rect, currentTime, options))
     });
     if (!response.ok) {
       const payload = await response.json().catch(() => null);
@@ -147,13 +161,14 @@ export default function Home() {
   }
 
   async function previewRepair(options: ProcessOptions) {
-    if (!video || !videoRect) {
+    const rect = videoRect ?? autoDetectResult?.recommended_rect ?? null;
+    if (!video || !rect) {
       return;
     }
     const response = await fetch(`${API_BASE_URL}/api/preview-repair-frame`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(buildPreviewPayload(video, videoRect, currentTime, options))
+      body: JSON.stringify(buildPreviewPayload(video, rect, currentTime, options))
     });
     if (!response.ok) {
       const payload = await response.json().catch(() => null);
@@ -165,6 +180,43 @@ export default function Home() {
       before_url: `${API_BASE_URL}${payload.before_url}`,
       after_url: `${API_BASE_URL}${payload.after_url}`
     });
+  }
+
+  async function previewEffect(options: ProcessOptions) {
+    await previewMask(options);
+    await previewRepair(options);
+  }
+
+  async function runAutoDetect(targetVideo = video) {
+    if (!targetVideo) {
+      return;
+    }
+    setIsAutoDetecting(true);
+    setError(null);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/auto-detect-subtitle-region`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ video_id: targetVideo.video_id, sample_count: 10 })
+      });
+      if (!response.ok) {
+        const payload = await response.json().catch(() => null);
+        throw new Error(payload?.detail ?? "自动识别字幕区域失败");
+      }
+      const payload = (await response.json()) as AutoDetectResult;
+      setAutoDetectResult({
+        ...payload,
+        sample_frames: payload.sample_frames.map((item) => ({
+          ...item,
+          preview_url: item.preview_url ? `${API_BASE_URL}${item.preview_url}` : undefined
+        }))
+      });
+      setAutoRect(payload.recommended_rect);
+      setVideoRect(payload.recommended_rect);
+      setProgress((current) => current ? { ...current, message: payload.reason } : current);
+    } finally {
+      setIsAutoDetecting(false);
+    }
   }
 
   return (
@@ -187,7 +239,8 @@ export default function Home() {
         <span>当前文件：{video?.filename ?? "-"}</span>
         <span>分辨率：{video ? `${video.width}×${video.height}` : "-"}</span>
         <span>时长：{video ? `${video.duration.toFixed(1)}s` : "-"}</span>
-        <span>当前模式：{progress?.engine ?? "Temporal OpenCV"}</span>
+        <span>当前模式：{workflowMode === "smart" ? "智能全消" : "手动框选"}</span>
+        <span>当前引擎：{progress?.engine ?? "Temporal OpenCV"}</span>
         <span>进度：{progress ? `${Math.round(progress.progress * 100)}%` : "0%"}</span>
       </section>
 
@@ -200,13 +253,16 @@ export default function Home() {
               outputUrl={downloadUrl}
               maskPreviewUrl={maskPreview?.mask_preview_url ?? null}
               showMaskOverlay={showMaskOverlay}
+              maskDisplayMode={maskDisplayMode}
               repairPreview={repairPreview}
               displayRect={displayRect}
               videoRect={videoRect}
+              autoRect={autoRect}
               onSelectionChange={handleSelectionChange}
               onVideoMetadata={handleVideoMetadata}
               onTimeChange={setCurrentTime}
               onToggleMaskOverlay={() => setShowMaskOverlay((value) => !value)}
+              onMaskDisplayModeChange={setMaskDisplayMode}
             />
           ) : (
             <section className="video-workbench empty-workbench">
@@ -228,13 +284,17 @@ export default function Home() {
             currentTime={currentTime}
             maskPreview={maskPreview}
             repairPreview={repairPreview}
+            autoDetectResult={autoDetectResult}
+            isAutoDetecting={isAutoDetecting}
+            workflowMode={workflowMode}
             jobId={jobId}
             progress={progress}
             onProgress={setProgress}
+            onWorkflowModeChange={setWorkflowMode}
+            onAutoDetect={() => runAutoDetect()}
             onStart={startProcessing}
             onCancel={cancelJob}
-            onPreviewMask={previewMask}
-            onPreviewRepair={previewRepair}
+            onPreviewEffect={previewEffect}
             onError={setError}
           />
         </aside>
