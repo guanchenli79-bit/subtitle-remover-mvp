@@ -11,7 +11,7 @@ import cv2
 import numpy as np
 
 
-ProgressCallback = Callable[[str, float, str], None]
+ProgressCallback = Callable[..., None]
 
 
 @dataclass
@@ -121,6 +121,7 @@ def repair_video(
 
     silent_video = work_dir / "repaired_no_audio.mp4"
     write_frames_to_video(repaired, silent_video, fps)
+    progress_callback("muxing_audio", 0.90, "合成音频", current_frame=len(frames), total_frames=len(frames))
     mux_audio(input_path, silent_video, output_path, keep_audio=keep_audio)
     return EngineResult(engine=engine, requested_mode=mode, output_path=output_path, message=f"completed with {engine}")
 
@@ -156,8 +157,14 @@ def repair_frames_fast(
     total = max(1, len(frames))
     for index, (frame, mask) in enumerate(zip(frames, masks)):
         repaired.append(_opencv_repair(frame, mask, options))
-        if index % 5 == 0:
-            progress_callback("repairing_frames", 0.55 + (index / total) * 0.3, f"OpenCV repairing {index + 1}/{total}")
+        if index % 5 == 0 or index == len(frames) - 1:
+            progress_callback(
+                "repairing_frames",
+                0.55 + ((index + 1) / total) * 0.3,
+                f"修复画面 {index + 1}/{total}",
+                current_frame=index + 1,
+                total_frames=total,
+            )
     return repaired
 
 
@@ -176,8 +183,14 @@ def repair_frames_temporal(
         prev_frame = frames[max(0, index - window)] if use_neighbors and window > 0 and index > 0 else None
         next_frame = frames[min(len(frames) - 1, index + window)] if use_neighbors and window > 0 and index < len(frames) - 1 else None
         repaired.append(_temporal_repair_single(frame, mask, prev_frame, next_frame, options))
-        if index % 5 == 0:
-            progress_callback("repairing_frames", 0.55 + (index / total) * 0.3, f"Temporal repairing {index + 1}/{total}")
+        if index % 5 == 0 or index == len(frames) - 1:
+            progress_callback(
+                "repairing_frames",
+                0.55 + ((index + 1) / total) * 0.3,
+                f"修复画面 {index + 1}/{total}",
+                current_frame=index + 1,
+                total_frames=total,
+            )
     return repaired
 
 
@@ -308,11 +321,20 @@ def _repair_with_propainter(
     frames_dir.mkdir(parents=True, exist_ok=True)
     masks_dir.mkdir(parents=True, exist_ok=True)
     result_dir.mkdir(parents=True, exist_ok=True)
-    progress_callback("extracting_frames", 0.50, "extracting frames")
+    total = max(1, len(frames))
+    progress_callback("extracting_frames", 0.50, "拆分视频帧", current_frame=0, total_frames=total)
     for index, (frame, mask) in enumerate(zip(frames, mask_sequence)):
         cv2.imwrite(str(frames_dir / f"{index:06d}.png"), frame)
         cv2.imwrite(str(masks_dir / f"{index:06d}.png"), mask)
-    progress_callback("running_propainter", 0.58, "running propainter")
+        if index % 10 == 0 or index == len(frames) - 1:
+            progress_callback(
+                "extracting_frames",
+                0.50 + ((index + 1) / total) * 0.06,
+                f"拆分视频帧 {index + 1}/{total}",
+                current_frame=index + 1,
+                total_frames=total,
+            )
+    progress_callback("running_propainter", 0.58, "运行 ProPainter")
     command = [
         "python",
         str(script_path),
@@ -336,7 +358,7 @@ def _repair_with_propainter(
         raise RuntimeError("ProPainter output frames could not be read")
     silent_video = work_dir / "propainter_no_audio.mp4"
     write_frames_to_video(repaired, silent_video, fps)
-    progress_callback("muxing_audio", 0.92, "muxing audio")
+    progress_callback("muxing_audio", 0.92, "合成音频")
     mux_audio(input_path, silent_video, output_path, keep_audio=keep_audio)
     return EngineResult(engine="ProPainter", requested_mode="high_quality", output_path=output_path, message="completed with ProPainter")
 
@@ -365,10 +387,19 @@ def _repair_with_lama_fallback(
     input_dir.mkdir(parents=True, exist_ok=True)
     mask_dir.mkdir(parents=True, exist_ok=True)
     output_dir.mkdir(parents=True, exist_ok=True)
+    total = max(1, len(frames))
     for index, (frame, mask) in enumerate(zip(frames, mask_sequence)):
         cv2.imwrite(str(input_dir / f"{index:06d}.png"), frame)
         cv2.imwrite(str(mask_dir / f"{index:06d}.png"), mask)
-    progress_callback("running_lama", 0.60, "running lama")
+        if index % 10 == 0 or index == len(frames) - 1:
+            progress_callback(
+                "extracting_frames",
+                0.50 + ((index + 1) / total) * 0.08,
+                f"准备 LaMa 帧 {index + 1}/{total}",
+                current_frame=index + 1,
+                total_frames=total,
+            )
+    progress_callback("running_lama", 0.60, "运行 LaMa")
     command = [
         "python",
         str(script_path),
@@ -392,7 +423,7 @@ def _repair_with_lama_fallback(
         raise RuntimeError("LaMa output frames could not be read")
     silent_video = work_dir / "lama_no_audio.mp4"
     write_frames_to_video(repaired, silent_video, fps)
-    progress_callback("muxing_audio", 0.92, "muxing audio")
+    progress_callback("muxing_audio", 0.92, "合成音频")
     mux_audio(input_path, silent_video, output_path, keep_audio=keep_audio)
     return EngineResult(engine="LaMa", requested_mode="high_quality", output_path=output_path, message="completed with LaMa")
 

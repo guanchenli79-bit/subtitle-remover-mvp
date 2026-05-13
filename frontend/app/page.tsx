@@ -29,10 +29,11 @@ export default function Home() {
   }, [video?.previewUrl]);
 
   const downloadUrl = useMemo(() => {
-    if (progress?.status !== "done" || !progress.download_url) {
+    if (!progress || !["completed", "done"].includes(progress.status)) {
       return null;
     }
-    return `${API_BASE_URL}${progress.download_url}`;
+    const outputPath = progress.output_url ?? progress.download_url;
+    return outputPath ? `${API_BASE_URL}${outputPath}` : null;
   }, [progress]);
 
   function handleUploaded(uploaded: UploadedVideo) {

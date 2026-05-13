@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from threading import Thread
 from typing import Literal
 
-from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -156,7 +157,7 @@ def preview_video(video_id: str) -> FileResponse:
 
 
 @app.post("/api/process")
-def process(request: ProcessRequest, background_tasks: BackgroundTasks) -> dict:
+def process(request: ProcessRequest) -> dict:
     try:
         metadata = storage.read_video_metadata(request.video_id)
     except FileNotFoundError as exc:
@@ -171,13 +172,17 @@ def process(request: ProcessRequest, background_tasks: BackgroundTasks) -> dict:
         raise HTTPException(status_code=400, detail="Rect is outside video bounds")
 
     job = jobs.create_job("任务已提交")
-    background_tasks.add_task(
-        process_video,
-        job_id=job.job_id,
-        video_id=request.video_id,
-        rect=rect,
-        options=request.options.model_dump(),
+    worker = Thread(
+        target=process_video,
+        kwargs={
+            "job_id": job.job_id,
+            "video_id": request.video_id,
+            "rect": rect,
+            "options": request.options.model_dump(),
+        },
+        daemon=True,
     )
+    worker.start()
     return {
         "job_id": job.job_id,
         "status": "processing",
@@ -185,19 +190,34 @@ def process(request: ProcessRequest, background_tasks: BackgroundTasks) -> dict:
     }
 
 
+@app.get("/api/status/{job_id}")
+def status(job_id: str) -> dict:
+    return _job_status_response(job_id)
+
+
 @app.get("/api/progress/{job_id}")
 def progress(job_id: str) -> dict:
+    return _job_status_response(job_id)
+
+
+def _job_status_response(job_id: str) -> dict:
     try:
         job = jobs.get_job(job_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Job not found") from exc
     return {
         "status": job["status"],
+        "stage": job["stage"],
         "step": job["step"],
         "progress": job["progress"],
         "message": job["message"],
+        "current_frame": job["current_frame"],
+        "total_frames": job["total_frames"],
+        "error": job["error"],
+        "output_url": job["output_url"],
         "download_url": job["download_url"],
         "engine": job.get("engine"),
+        "updated_at": job["updated_at"],
     }
 
 
@@ -209,11 +229,17 @@ def cancel(job_id: str) -> dict:
         raise HTTPException(status_code=404, detail="Job not found") from exc
     return {
         "status": job["status"],
+        "stage": job["stage"],
         "step": job["step"],
         "progress": job["progress"],
         "message": job["message"],
+        "current_frame": job["current_frame"],
+        "total_frames": job["total_frames"],
+        "error": job["error"],
+        "output_url": job["output_url"],
         "download_url": job["download_url"],
         "engine": job.get("engine"),
+        "updated_at": job["updated_at"],
     }
 
 
@@ -267,7 +293,7 @@ def download(job_id: str) -> FileResponse:
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Job not found") from exc
 
-    if job["status"] != "done":
+    if job["status"] not in {"done", "completed"}:
         raise HTTPException(status_code=409, detail="Job is not complete")
 
     path = storage.output_path(job_id)

@@ -20,13 +20,32 @@ export type ProcessOptions = {
 };
 
 export type ProgressState = {
-  status: "idle" | "processing" | "done" | "failed" | "cancelled";
-  step?: "uploaded" | "probing" | "detecting_masks" | "extracting_frames" | "repairing_frames" | "running_propainter" | "running_lama" | "muxing_audio" | "completed" | "failed" | "cancelled";
+  status: "idle" | "processing" | "completed" | "done" | "failed" | "cancelled";
+  stage?: ProgressStage;
+  step?: ProgressStage;
   progress: number;
   message: string;
-  download_url: string | null;
+  current_frame?: number;
+  total_frames?: number;
+  error?: string | null;
+  output_url?: string | null;
+  download_url?: string | null;
   engine?: string | null;
+  updated_at?: number;
 };
+
+type ProgressStage =
+  | "uploaded"
+  | "probing"
+  | "detecting_masks"
+  | "extracting_frames"
+  | "repairing_frames"
+  | "running_propainter"
+  | "running_lama"
+  | "muxing_audio"
+  | "completed"
+  | "failed"
+  | "cancelled";
 
 export type MaskPreview = {
   mask_preview_url: string;
@@ -98,6 +117,10 @@ export function ProcessingPanel({
   const [engineStatus, setEngineStatus] = useState<EngineStatus | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isPreviewing, setIsPreviewing] = useState(false);
+  const [pollFailureCount, setPollFailureCount] = useState(0);
+  const [pollMessage, setPollMessage] = useState<string | null>(null);
+  const [lastProgressAt, setLastProgressAt] = useState<number | null>(null);
+  const [clock, setClock] = useState(Date.now());
 
   useEffect(() => {
     let active = true;
@@ -120,13 +143,28 @@ export function ProcessingPanel({
 
   useEffect(() => {
     if (!jobId) {
+      setPollFailureCount(0);
+      setPollMessage(null);
+      setLastProgressAt(null);
       return;
     }
 
     let isActive = true;
-    const timer = window.setInterval(async () => {
+    let retryTimer: number | null = null;
+    let failureCount = 0;
+
+    const scheduleNextPoll = (delayMs: number) => {
+      retryTimer = window.setTimeout(poll, delayMs);
+    };
+
+    const poll = async () => {
+      const controller = new AbortController();
+      const timeout = window.setTimeout(() => controller.abort(), 7000);
       try {
-        const response = await fetch(`${apiBaseUrl}/api/progress/${jobId}`);
+        const response = await fetch(`${apiBaseUrl}/api/status/${jobId}`, {
+          cache: "no-store",
+          signal: controller.signal
+        });
         if (!response.ok) {
           throw new Error("进度获取失败");
         }
@@ -134,25 +172,52 @@ export function ProcessingPanel({
         if (!isActive) {
           return;
         }
+        failureCount = 0;
+        setPollFailureCount(0);
+        setPollMessage(null);
+        setLastProgressAt(Date.now());
+        onError(null);
         onProgress(payload);
-        if (payload.status === "done" || payload.status === "failed" || payload.status === "cancelled") {
-          window.clearInterval(timer);
+        if (isTerminalStatus(payload.status)) {
           if (payload.status === "failed") {
-            onError(payload.message);
+            onError(payload.error ?? payload.message ?? "任务处理失败");
           }
+          return;
         }
+        scheduleNextPoll(900);
       } catch (error) {
         if (isActive) {
-          onError(error instanceof Error ? error.message : "进度获取失败");
+          failureCount += 1;
+          setPollFailureCount(failureCount);
+          setPollMessage(
+            failureCount <= 3
+              ? "正在重新连接进度..."
+              : "进度连接不稳定，但任务可能仍在运行"
+          );
+          scheduleNextPoll(Math.min(3500, 900 + failureCount * 400));
         }
+      } finally {
+        window.clearTimeout(timeout);
       }
-    }, 800);
+    };
+
+    setPollFailureCount(0);
+    setPollMessage(null);
+    setLastProgressAt(null);
+    poll();
 
     return () => {
       isActive = false;
-      window.clearInterval(timer);
+      if (retryTimer !== null) {
+        window.clearTimeout(retryTimer);
+      }
     };
   }, [apiBaseUrl, jobId, onError, onProgress]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setClock(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, []);
 
   async function handleStart() {
     setIsSubmitting(true);
@@ -194,11 +259,14 @@ export function ProcessingPanel({
   }
 
   const percentage = Math.round((progress?.progress ?? 0) * 100);
-  const downloadUrl =
-    progress?.status === "done" && progress.download_url ? `${apiBaseUrl}${progress.download_url}` : null;
+  const stage = getProgressStage(progress);
+  const outputPath = getOutputPath(progress);
+  const downloadUrl = progress && isCompleteStatus(progress.status) && outputPath ? `${apiBaseUrl}${outputPath}` : null;
   const canProcess = Boolean(video && videoRect && videoRect.width > 0 && videoRect.height > 0);
   const isProcessing = Boolean(jobId && progress?.status === "processing");
   const actualEngine = progress?.engine || engineStatus?.actual_engine || "Temporal OpenCV";
+  const frameText = frameProgressText(progress);
+  const lastUpdateText = lastProgressAt ? formatLastUpdated(lastProgressAt, clock) : "-";
 
   return (
     <div className="control-stack">
@@ -304,7 +372,7 @@ export function ProcessingPanel({
       <section className="tool-card">
         <div className="card-title">
           <span>操作</span>
-          <small>{progress?.step ? stepLabel(progress.step) : "等待处理"}</small>
+          <small>{stage ? stepLabel(stage) : "等待处理"}</small>
         </div>
         <div className="action-grid">
           <button type="button" className="primary-button" disabled={!canProcess || isSubmitting || isProcessing} onClick={handleStart}>
@@ -327,12 +395,20 @@ export function ProcessingPanel({
         <div className="progress-track">
           <div className="progress-fill" style={{ width: `${percentage}%` }} />
         </div>
+        {pollMessage ? (
+          <div className={`poll-warning ${pollFailureCount > 3 ? "unstable" : ""}`}>
+            {pollMessage}
+          </div>
+        ) : null}
         <InfoGrid
           items={[
-            ["当前步骤", progress?.step ? stepLabel(progress.step) : "-"],
+            ["当前步骤", stage ? stepLabel(stage) : "-"],
             ["任务状态", progress?.status ?? "idle"],
+            ["当前帧", frameText],
             ["实际引擎", actualEngine],
-            ["后端信息", progress?.message ?? "等待开始处理"]
+            ["最后更新", lastUpdateText],
+            ["后端信息", progress?.message ?? "等待开始处理"],
+            ["错误信息", progress?.error ?? "-"]
           ]}
         />
       </section>
@@ -400,8 +476,36 @@ function Coord({ label, value }: { label: string; value: number | undefined }) {
   );
 }
 
-function stepLabel(step: NonNullable<ProgressState["step"]>) {
-  const labels: Record<NonNullable<ProgressState["step"]>, string> = {
+function getProgressStage(progress: ProgressState | null): ProgressStage | undefined {
+  return progress?.stage ?? progress?.step;
+}
+
+function isCompleteStatus(status: ProgressState["status"]) {
+  return status === "completed" || status === "done";
+}
+
+function isTerminalStatus(status: ProgressState["status"]) {
+  return isCompleteStatus(status) || status === "failed" || status === "cancelled";
+}
+
+function getOutputPath(progress: ProgressState | null) {
+  return progress?.output_url ?? progress?.download_url ?? null;
+}
+
+function frameProgressText(progress: ProgressState | null) {
+  if (!progress?.total_frames) {
+    return "-";
+  }
+  return `${progress.current_frame ?? 0} / ${progress.total_frames}`;
+}
+
+function formatLastUpdated(lastProgressAt: number, now: number) {
+  const seconds = Math.max(0, Math.round((now - lastProgressAt) / 1000));
+  return seconds <= 1 ? "刚刚" : `${seconds} 秒前`;
+}
+
+function stepLabel(step: ProgressStage) {
+  const labels: Record<ProgressStage, string> = {
     uploaded: "读取视频",
     probing: "读取视频",
     detecting_masks: "生成字幕 mask",

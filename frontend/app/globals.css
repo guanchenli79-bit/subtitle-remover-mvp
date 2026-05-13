@@ -702,6 +702,22 @@ details.tool-card > *:not(summary) {
   transition: width 160ms ease;
 }
 
+.poll-warning {
+  margin-bottom: 12px;
+  padding: 9px 10px;
+  border-radius: 8px;
+  border: 1px solid rgba(250, 204, 21, 0.36);
+  color: #fde68a;
+  background: rgba(113, 63, 18, 0.22);
+  font-size: 13px;
+}
+
+.poll-warning.unstable {
+  border-color: rgba(251, 146, 60, 0.46);
+  color: #fed7aa;
+  background: rgba(124, 45, 18, 0.28);
+}
+
 .toast {
   position: fixed;
   right: 22px;

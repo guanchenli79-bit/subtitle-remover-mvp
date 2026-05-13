@@ -59,6 +59,8 @@ def process_video(
             step="probing",
             progress=0.03,
             message="读取视频",
+            current_frame=0,
+            total_frames=0,
             engine=choose_engine(options.get("repair_mode", "balanced")),
         )
         original_path = storage.get_upload_path(video_id)
@@ -69,6 +71,7 @@ def process_video(
 
         fps = float(capture.get(cv2.CAP_PROP_FPS) or metadata["fps"] or 25)
         total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or metadata.get("frame_count") or 0)
+        jobs.update_job(job_id, step="probing", progress=0.04, message="读取视频", current_frame=0, total_frames=total_frames)
         frames: list[np.ndarray] = []
         while True:
             ok, frame = capture.read()
@@ -88,7 +91,7 @@ def process_video(
         detections: list[MaskDetectionResult] = []
         total = max(1, len(frames))
         reference_mask: np.ndarray | None = None
-        jobs.update_job(job_id, step="detecting_masks", progress=0.08, message="生成字幕 mask")
+        jobs.update_job(job_id, step="detecting_masks", progress=0.08, message="生成字幕 mask", current_frame=0, total_frames=total)
         for index, frame in enumerate(frames):
             if jobs.is_cancel_requested(job_id):
                 _mark_cancelled(job_id)
@@ -114,6 +117,8 @@ def process_video(
                     step="detecting_masks",
                     progress=0.08 + (index + 1) / total * 0.38,
                     message=f"生成字幕 mask {index + 1}/{total}",
+                    current_frame=index + 1,
+                    total_frames=total,
                 )
 
         if jobs.is_cancel_requested(job_id):
@@ -122,8 +127,22 @@ def process_video(
 
         output_path = storage.output_path(job_id)
 
-        def progress_callback(step: str, progress: float, message: str) -> None:
-            jobs.update_job(job_id, step=step, progress=progress, message=message)
+        def progress_callback(
+            step: str,
+            progress: float,
+            message: str,
+            *,
+            current_frame: int | None = None,
+            total_frames: int | None = None,
+        ) -> None:
+            jobs.update_job(
+                job_id,
+                step=step,
+                progress=progress,
+                message=message,
+                current_frame=current_frame,
+                total_frames=total_frames,
+            )
 
         result = repair_video(
             input_path=original_path,
@@ -141,11 +160,13 @@ def process_video(
         avg_coverage = sum(item.mask_coverage for item in detections) / max(1, len(detections))
         jobs.update_job(
             job_id,
-            status="done",
+            status="completed",
             step="completed",
             progress=1.0,
             message=f"输出完成，实际引擎：{result.engine}，平均 mask 覆盖率 {avg_coverage:.2%}",
-            download_url=f"/api/download/{job_id}",
+            current_frame=total,
+            total_frames=total,
+            output_url=f"/api/download/{job_id}",
             engine=result.engine,
         )
     except Exception as exc:
@@ -153,8 +174,8 @@ def process_video(
             job_id,
             status="failed",
             step="failed",
-            progress=0.0,
             message=str(exc),
+            error=str(exc),
         )
     finally:
         if work_dir is not None:
@@ -269,6 +290,5 @@ def _mark_cancelled(job_id: str) -> None:
         job_id,
         status="cancelled",
         step="cancelled",
-        progress=0.0,
         message="任务已取消",
     )
