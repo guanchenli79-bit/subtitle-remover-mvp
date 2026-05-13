@@ -1,6 +1,6 @@
 "use client";
 
-import { PointerEvent, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import { PointerEvent, type CSSProperties, useEffect, useMemo, useRef, useState } from "react";
 import type { UploadedVideo } from "./VideoUploader";
 
 export type DisplayRect = {
@@ -17,11 +17,6 @@ export type VideoRect = {
   height: number;
 };
 
-export type SelectionState = {
-  displayRect: DisplayRect;
-  videoRect: VideoRect;
-};
-
 export type VideoMetadata = {
   width: number;
   height: number;
@@ -32,99 +27,90 @@ type Props = {
   video: UploadedVideo;
   videoUrl: string;
   outputUrl: string | null;
-  selection: SelectionState | null;
-  onSelectionChange: (selection: SelectionState | null) => void;
+  maskPreviewUrl: string | null;
+  showMaskOverlay: boolean;
+  repairPreview: RepairPreview | null;
+  displayRect: DisplayRect | null;
+  videoRect: VideoRect | null;
+  onSelectionChange: (displayRect: DisplayRect | null, videoRect: VideoRect | null) => void;
   onVideoMetadata: (metadata: VideoMetadata) => void;
+  onTimeChange: (time: number) => void;
+  onToggleMaskOverlay: () => void;
 };
 
-type PreviewMode = "before" | "after" | "mask" | "repair";
-
-type Point = {
-  x: number;
-  y: number;
+export type RepairPreview = {
+  before_url: string;
+  after_url: string;
+  engine: string;
+  mask_coverage: number;
 };
 
-type DragHandle = "n" | "s" | "e" | "w" | "nw" | "ne" | "sw" | "se";
+type DragMode = "draw" | "move" | "resize";
+type ResizeHandle = "nw" | "ne" | "sw" | "se";
 
-type Interaction =
-  | { mode: "draw"; pointerId: number; start: Point; current: Point }
-  | { mode: "move"; pointerId: number; start: Point; startRect: DisplayRect }
-  | { mode: "resize"; pointerId: number; handle: DragHandle; start: Point; startRect: DisplayRect };
-
-type ContainedVideoRect = {
-  offsetX: number;
-  offsetY: number;
-  displayedWidth: number;
-  displayedHeight: number;
-  elementWidth: number;
-  elementHeight: number;
+type Interaction = {
+  mode: DragMode;
+  handle?: ResizeHandle;
+  startX: number;
+  startY: number;
+  originRect: DisplayRect | null;
+  draftRect: DisplayRect;
 };
-
-const MIN_SELECTION_SIZE = 8;
-const RESIZE_HANDLES: DragHandle[] = ["nw", "n", "ne", "e", "se", "s", "sw", "w"];
 
 export function VideoAnnotator({
   video,
   videoUrl,
   outputUrl,
-  selection,
+  maskPreviewUrl,
+  showMaskOverlay,
+  repairPreview,
+  displayRect,
+  videoRect,
   onSelectionChange,
-  onVideoMetadata
+  onVideoMetadata,
+  onTimeChange,
+  onToggleMaskOverlay
 }: Props) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
-  const overlayRef = useRef<HTMLDivElement | null>(null);
   const [interaction, setInteraction] = useState<Interaction | null>(null);
-  const [draftRect, setDraftRect] = useState<DisplayRect | null>(null);
-  const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(video.duration || 0);
-  const [previewMode, setPreviewMode] = useState<PreviewMode>("before");
-  const [metadata, setMetadata] = useState<VideoMetadata>({
-    width: video.width,
-    height: video.height,
-    duration: video.duration || 0
-  });
+  const [isPlaying, setIsPlaying] = useState(false);
   const [checkpointTime, setCheckpointTime] = useState(0);
+  const [comparisonPosition, setComparisonPosition] = useState(50);
 
-  useEffect(() => {
-    const element = videoRef.current;
-    if (!element) {
-      return;
-    }
-
-    const observer = new ResizeObserver(() => syncSelectionFromVideoRect());
-    observer.observe(element);
-    return () => observer.disconnect();
-  }, [selection?.videoRect?.x, selection?.videoRect?.y, selection?.videoRect?.width, selection?.videoRect?.height]);
+  const naturalWidth = video.width || 16;
+  const naturalHeight = video.height || 9;
+  const activeRect = interaction?.draftRect ?? displayRect;
+  const orientation = naturalHeight > naturalWidth ? "竖屏" : "横屏";
+  const aspectRatio = `${naturalWidth} / ${naturalHeight}`;
+  const maxFrameWidth = `min(100%, calc(70vh * ${naturalWidth / naturalHeight}))`;
 
   useEffect(() => {
     setCurrentTime(0);
     setDuration(video.duration || 0);
-    setMetadata({
-      width: video.width,
-      height: video.height,
-      duration: video.duration || 0
-    });
+    setIsPlaying(false);
     setCheckpointTime(0);
-    setInteraction(null);
-    setDraftRect(null);
-  }, [video.video_id, video.width, video.height, video.duration]);
+  }, [video.video_id, video.duration]);
 
-  const videoRatio = useMemo(() => {
-    const width = metadata.width || video.width || 16;
-    const height = metadata.height || video.height || 9;
-    return width / height;
-  }, [metadata.width, metadata.height, video.width, video.height]);
-  const aspectRatio = useMemo(() => {
-    const width = metadata.width || video.width || 16;
-    const height = metadata.height || video.height || 9;
-    return `${width} / ${height}`;
-  }, [metadata.width, metadata.height, video.width, video.height]);
+  const timeLabel = useMemo(() => {
+    return `${formatTime(currentTime)} / ${formatTime(duration)}`;
+  }, [currentTime, duration]);
 
-  const activeRect = draftRect ?? selection?.displayRect ?? null;
-  const usesOutputPreview = (previewMode === "after" || previewMode === "repair") && Boolean(outputUrl);
-  const activeVideoUrl = usesOutputPreview && outputUrl ? outputUrl : videoUrl;
-  const canEditSelection = previewMode === "before" || previewMode === "mask";
+  function emitSelection(nextDisplayRect: DisplayRect | null) {
+    if (!nextDisplayRect || !videoRef.current) {
+      onSelectionChange(null, null);
+      return;
+    }
+
+    const nextVideoRect = displayRectToVideoRect(nextDisplayRect, videoRef.current);
+    if (nextVideoRect.width <= 0 || nextVideoRect.height <= 0) {
+      onSelectionChange(null, null);
+      return;
+    }
+
+    onSelectionChange(roundDisplayRect(nextDisplayRect), nextVideoRect);
+  }
 
   function handleLoadedMetadata() {
     const element = videoRef.current;
@@ -132,40 +118,32 @@ export function VideoAnnotator({
       return;
     }
 
-    const nextMetadata = {
-      width: element.videoWidth || video.width,
-      height: element.videoHeight || video.height,
-      duration: Number.isFinite(element.duration) ? element.duration : video.duration || 0
+    const metadata = {
+      width: element.videoWidth,
+      height: element.videoHeight,
+      duration: element.duration || 0
     };
-    setDuration(nextMetadata.duration);
-    setMetadata(nextMetadata);
-    onVideoMetadata(nextMetadata);
-    window.requestAnimationFrame(syncSelectionFromVideoRect);
+    setDuration(metadata.duration);
+    onVideoMetadata(metadata);
   }
 
-  function syncSelectionFromVideoRect() {
+  function handleTimeUpdate() {
     const element = videoRef.current;
-    if (!element || !selection?.videoRect || element.videoWidth <= 0 || element.videoHeight <= 0) {
+    if (!element) {
       return;
     }
-
-    const nextDisplayRect = videoRectToDisplayRect(selection.videoRect, element);
-    if (!rectsNearlyEqual(nextDisplayRect, selection.displayRect)) {
-      onSelectionChange({
-        displayRect: roundDisplayRect(nextDisplayRect),
-        videoRect: selection.videoRect
-      });
-    }
+    setCurrentTime(element.currentTime);
+    onTimeChange(element.currentTime);
   }
 
-  async function togglePlayback() {
+  function togglePlayback() {
     const element = videoRef.current;
     if (!element) {
       return;
     }
 
     if (element.paused) {
-      await element.play().catch(() => undefined);
+      void element.play();
     } else {
       element.pause();
     }
@@ -176,480 +154,322 @@ export function VideoAnnotator({
     if (!element) {
       return;
     }
-
-    const nextTime = clamp(value, 0, duration || 0);
-    element.currentTime = nextTime;
-    setCurrentTime(nextTime);
-  }
-
-  function restart() {
-    seekTo(0);
+    element.currentTime = clamp(value, 0, duration || 0);
+    setCurrentTime(element.currentTime);
+    onTimeChange(element.currentTime);
   }
 
   function stepFrame(direction: -1 | 1) {
-    const element = videoRef.current;
-    if (!element) {
-      return;
-    }
-    element.pause();
-    const fps = Math.max(1, video.fps || 25);
-    seekTo(element.currentTime + direction / fps);
+    const fps = video.fps || 25;
+    seekTo(currentTime + direction / fps);
   }
 
-  function jumpToCheckpoint() {
-    seekTo(checkpointTime || Math.min(duration, duration * 0.82));
-  }
-
-  function pointFromEvent(event: PointerEvent<HTMLElement>): Point | null {
-    const element = videoRef.current;
-    if (!element) {
-      return null;
+  function pointFromEvent(event: PointerEvent<HTMLDivElement>) {
+    const bounds = videoRef.current?.getBoundingClientRect();
+    if (!bounds) {
+      return { x: 0, y: 0 };
     }
-
-    const bounds = element.getBoundingClientRect();
-    const contained = getContainedVideoRect(element);
-    const rawX = event.clientX - bounds.left;
-    const rawY = event.clientY - bounds.top;
     return {
-      x: clamp(rawX, contained.offsetX, contained.offsetX + contained.displayedWidth),
-      y: clamp(rawY, contained.offsetY, contained.offsetY + contained.displayedHeight)
+      x: clamp(event.clientX - bounds.left, 0, bounds.width),
+      y: clamp(event.clientY - bounds.top, 0, bounds.height)
     };
   }
 
-  function handleLayerPointerDown(event: PointerEvent<HTMLDivElement>) {
-    if (event.button !== 0) {
-      return;
-    }
+  function handlePointerDown(event: PointerEvent<HTMLDivElement>) {
     const point = pointFromEvent(event);
-    if (!point) {
-      return;
-    }
+    const hit = hitTest(point, displayRect);
+    const originRect = displayRect ? { ...displayRect } : null;
+    const draftRect = originRect ?? normalizeRect(point.x, point.y, point.x, point.y);
 
     event.currentTarget.setPointerCapture(event.pointerId);
     setInteraction({
-      mode: "draw",
-      pointerId: event.pointerId,
-      start: point,
-      current: point
-    });
-    setDraftRect(null);
-  }
-
-  function handleSelectionPointerDown(event: PointerEvent<HTMLDivElement>) {
-    if (event.button !== 0 || !selection) {
-      return;
-    }
-    event.stopPropagation();
-    const point = pointFromEvent(event);
-    if (!point) {
-      return;
-    }
-
-    overlayRef.current?.setPointerCapture(event.pointerId);
-    setInteraction({
-      mode: "move",
-      pointerId: event.pointerId,
-      start: point,
-      startRect: selection.displayRect
-    });
-  }
-
-  function handleResizePointerDown(handle: DragHandle, event: PointerEvent<HTMLDivElement>) {
-    if (event.button !== 0 || !selection) {
-      return;
-    }
-    event.stopPropagation();
-    const point = pointFromEvent(event);
-    if (!point) {
-      return;
-    }
-
-    overlayRef.current?.setPointerCapture(event.pointerId);
-    setInteraction({
-      mode: "resize",
-      pointerId: event.pointerId,
-      handle,
-      start: point,
-      startRect: selection.displayRect
+      mode: hit.mode,
+      handle: hit.handle,
+      startX: point.x,
+      startY: point.y,
+      originRect,
+      draftRect
     });
   }
 
   function handlePointerMove(event: PointerEvent<HTMLDivElement>) {
-    if (!interaction || interaction.pointerId !== event.pointerId) {
+    if (!interaction) {
+      return;
+    }
+
+    const bounds = videoRef.current?.getBoundingClientRect();
+    if (!bounds) {
       return;
     }
 
     const point = pointFromEvent(event);
-    const element = videoRef.current;
-    if (!point || !element) {
-      return;
-    }
-
-    let nextRect: DisplayRect;
-    if (interaction.mode === "draw") {
-      nextRect = constrainRectToVideo(normalizeRect(interaction.start, point), element);
-      setInteraction({ ...interaction, current: point });
-    } else if (interaction.mode === "move") {
-      nextRect = moveRect(interaction.startRect, point.x - interaction.start.x, point.y - interaction.start.y, element);
-    } else {
-      nextRect = resizeRect(
-        interaction.startRect,
-        interaction.handle,
-        point.x - interaction.start.x,
-        point.y - interaction.start.y,
-        element
-      );
-    }
-
-    setDraftRect(nextRect);
-    if (nextRect.width >= MIN_SELECTION_SIZE && nextRect.height >= MIN_SELECTION_SIZE) {
-      commitDisplayRect(nextRect, false);
-    }
+    const nextRect = rectForInteraction(interaction, point, bounds.width, bounds.height);
+    setInteraction({ ...interaction, draftRect: nextRect });
+    emitSelection(nextRect);
   }
 
-  function handlePointerUp(event: PointerEvent<HTMLDivElement>) {
-    if (!interaction || interaction.pointerId !== event.pointerId) {
+  function handlePointerUp() {
+    if (!interaction) {
       return;
     }
 
-    const nextRect = draftRect;
-    const wasClick =
-      interaction.mode === "draw" &&
-      Math.abs(interaction.current.x - interaction.start.x) < 3 &&
-      Math.abs(interaction.current.y - interaction.start.y) < 3;
+    const movedX = Math.abs(interaction.draftRect.x - (interaction.originRect?.x ?? interaction.startX));
+    const movedY = Math.abs(interaction.draftRect.y - (interaction.originRect?.y ?? interaction.startY));
+    const isClick = interaction.mode === "draw" && interaction.draftRect.width < 4 && interaction.draftRect.height < 4 && movedX < 4 && movedY < 4;
 
+    if (isClick) {
+      setInteraction(null);
+      togglePlayback();
+      return;
+    }
+
+    if (interaction.draftRect.width < 6 || interaction.draftRect.height < 6) {
+      setInteraction(null);
+      return;
+    }
+
+    setCheckpointTime(videoRef.current?.currentTime ?? currentTime);
+    emitSelection(interaction.draftRect);
     setInteraction(null);
-    setDraftRect(null);
-
-    if (wasClick) {
-      void togglePlayback();
-      return;
-    }
-
-    if (nextRect && nextRect.width >= MIN_SELECTION_SIZE && nextRect.height >= MIN_SELECTION_SIZE) {
-      commitDisplayRect(nextRect, true);
-    }
-  }
-
-  function commitDisplayRect(displayRect: DisplayRect, updateCheckpoint: boolean) {
-    const element = videoRef.current;
-    if (!element || element.videoWidth <= 0 || element.videoHeight <= 0) {
-      return;
-    }
-
-    const constrained = roundDisplayRect(constrainRectToVideo(displayRect, element));
-    const videoRect = displayRectToVideoRect(constrained, element);
-    onSelectionChange({
-      displayRect: constrained,
-      videoRect
-    });
-    if (updateCheckpoint) {
-      setCheckpointTime(videoRef.current?.currentTime ?? 0);
-    }
   }
 
   return (
-    <>
-      <section className="viewer-panel">
-        <div className="viewer-toolbar">
-          <div>
-            <span className="eyebrow">Preview</span>
-            <h1>{video.filename}</h1>
-          </div>
-          <div className="time-readout">当前帧 {formatTime(currentTime)}</div>
+    <section className="video-workbench">
+      <div className="video-toolbar">
+        <div>
+          <strong>视频预览与字幕框选</strong>
+          <span>{orientation} · 当前帧 {formatTime(currentTime)}</span>
         </div>
-
-        <div className="preview-tabs" aria-label="预览模式">
-          <PreviewTab active={previewMode === "before"} label="Before" onClick={() => setPreviewMode("before")} />
-          <PreviewTab active={previewMode === "after"} label="After" onClick={() => setPreviewMode("after")} />
-          <PreviewTab active={previewMode === "mask"} label="Mask" onClick={() => setPreviewMode("mask")} />
-          <PreviewTab active={previewMode === "repair"} label="Frame Repair" onClick={() => setPreviewMode("repair")} />
+        <div className="video-badges">
+          <span>{naturalWidth}×{naturalHeight}</span>
+          {videoRect ? <span>真实坐标 {videoRect.x},{videoRect.y},{videoRect.width},{videoRect.height}</span> : null}
         </div>
+      </div>
 
-        <div className="video-shell">
-          <div className="video-canvas" style={{ aspectRatio, maxWidth: `min(100%, ${Math.min(160, Math.max(32, 70 * videoRatio))}vh)` }}>
-            <video
-              ref={videoRef}
-              className="preview-video"
-              src={activeVideoUrl}
-              controls={false}
-              playsInline
-              preload="metadata"
-              onLoadedMetadata={handleLoadedMetadata}
-              onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)}
-              onPlay={() => setIsPlaying(true)}
-              onPause={() => setIsPlaying(false)}
-              onEnded={() => setIsPlaying(false)}
-            />
-            <div
-              ref={overlayRef}
-              className="annotation-layer"
-              onPointerDown={canEditSelection ? handleLayerPointerDown : undefined}
-              onPointerMove={handlePointerMove}
-              onPointerUp={handlePointerUp}
-              onPointerCancel={() => {
-                setInteraction(null);
-                setDraftRect(null);
-              }}
-            >
-              {activeRect && previewMode !== "after" ? (
-                <div
-                  className={`selection-box ${previewMode === "mask" ? "mask-preview" : ""}`}
-                  style={rectStyle(activeRect)}
-                  onPointerDown={canEditSelection ? handleSelectionPointerDown : undefined}
-                >
-                  {previewMode === "mask" ? <div className="mask-fill" /> : null}
-                  {canEditSelection
-                    ? RESIZE_HANDLES.map((handle) => (
-                        <div
-                          key={handle}
-                          className={`resize-handle ${handle}`}
-                          onPointerDown={(event) => handleResizePointerDown(handle, event)}
-                        />
-                      ))
-                    : null}
-                </div>
-              ) : null}
-              {previewMode === "after" && !outputUrl ? <div className="preview-watermark">等待处理结果</div> : null}
-              {previewMode === "repair" && !outputUrl ? <div className="preview-watermark">完成处理后显示当前帧修复预览</div> : null}
-            </div>
+      <div className="video-canvas-shell">
+        <div className="video-frame" style={{ aspectRatio, maxWidth: maxFrameWidth }}>
+          <video
+            ref={videoRef}
+            className="preview-video"
+            src={videoUrl}
+            playsInline
+            preload="metadata"
+            onLoadedMetadata={handleLoadedMetadata}
+            onTimeUpdate={handleTimeUpdate}
+            onPlay={() => setIsPlaying(true)}
+            onPause={() => setIsPlaying(false)}
+            onEnded={() => setIsPlaying(false)}
+          />
+          <div
+            className="annotation-layer"
+            onPointerDown={handlePointerDown}
+            onPointerMove={handlePointerMove}
+            onPointerUp={handlePointerUp}
+            onPointerCancel={() => setInteraction(null)}
+          >
+            {activeRect ? (
+              <div className="selection-box" style={rectStyle(activeRect)}>
+                <span className="selection-label">字幕区域</span>
+                <span className="resize-handle nw" data-handle="nw" />
+                <span className="resize-handle ne" data-handle="ne" />
+                <span className="resize-handle sw" data-handle="sw" />
+                <span className="resize-handle se" data-handle="se" />
+              </div>
+            ) : null}
+            {maskPreviewUrl && showMaskOverlay ? (
+              <img className="mask-preview-overlay" src={maskPreviewUrl} alt="mask preview overlay" />
+            ) : null}
           </div>
         </div>
+      </div>
 
-        <div className="video-controls">
-          <button type="button" className="control-button" onClick={() => void togglePlayback()}>
-            {isPlaying ? "暂停" : "播放"}
-          </button>
-          <button type="button" className="control-button" onClick={restart}>
-            回到开头
-          </button>
-          <button type="button" className="control-button icon-button" onClick={() => stepFrame(-1)} aria-label="上一帧">
-            -1f
-          </button>
-          <button type="button" className="control-button icon-button" onClick={() => stepFrame(1)} aria-label="下一帧">
-            +1f
-          </button>
-          <button type="button" className="control-button" onClick={jumpToCheckpoint}>
-            跳到检查点
-          </button>
+      <div className="custom-controls">
+        <button type="button" className="control-button" onClick={togglePlayback}>
+          {isPlaying ? "暂停" : "播放"}
+        </button>
+        <button type="button" className="control-button" onClick={() => seekTo(0)}>
+          回到开头
+        </button>
+        <button type="button" className="control-button" onClick={() => seekTo(checkpointTime)}>
+          跳到字幕检查点
+        </button>
+        <button type="button" className="control-button" onClick={() => stepFrame(-1)}>
+          前一帧
+        </button>
+        <button type="button" className="control-button" onClick={() => stepFrame(1)}>
+          下一帧
+        </button>
+        <button type="button" className={`control-button ${showMaskOverlay ? "active" : ""}`} onClick={onToggleMaskOverlay}>
+          Mask 叠加
+        </button>
+        <span className="time-readout">{timeLabel}</span>
+        <input
+          className="timeline"
+          type="range"
+          min={0}
+          max={duration || 0}
+          step={0.01}
+          value={Math.min(currentTime, duration || 0)}
+          onChange={(event) => seekTo(Number(event.target.value))}
+          aria-label="视频进度"
+        />
+      </div>
 
-          <span className="time-code">{formatTime(currentTime)}</span>
+      {repairPreview ? (
+        <div className="repair-compare">
+          <div className="compare-title">
+            <strong>当前帧修复预览</strong>
+            <span>{repairPreview.engine} · mask {(repairPreview.mask_coverage * 100).toFixed(1)}%</span>
+          </div>
+          <div className="before-after" style={{ "--split": `${comparisonPosition}%` } as CSSProperties}>
+            <img src={repairPreview.before_url} alt="repair preview before" />
+            <img className="after-image" src={repairPreview.after_url} alt="repair preview after" />
+            <div className="split-line" />
+          </div>
           <input
             className="timeline"
             type="range"
             min={0}
-            max={duration || 0}
-            step={0.01}
-            value={Math.min(currentTime, duration || 0)}
-            onChange={(event) => seekTo(Number(event.target.value))}
+            max={100}
+            value={comparisonPosition}
+            onChange={(event) => setComparisonPosition(Number(event.target.value))}
+            aria-label="before after comparison"
           />
-          <span className="time-code">{formatTime(duration)}</span>
         </div>
+      ) : null}
 
-        <div className="selection-hint">
-          {selection
-            ? "拖动选区可移动，拖动边角可调整大小。点击空白视频区域可播放或暂停。"
-            : "在视频画面上拖拽框选字幕区域。选区会换算成真实视频像素坐标。"}
+      <div className="comparison-strip">
+        <div>
+          <span>处理前</span>
+          <video src={videoUrl} muted preload="metadata" />
         </div>
-      </section>
-
-      <section className="viewer-panel result-panel">
-        <div className="panel-heading">
-          <div>
-            <span className="eyebrow">Compare</span>
-            <h2>前后对比与诊断预览</h2>
-          </div>
+        <div>
+          <span>处理后</span>
+          {outputUrl ? <video src={outputUrl} muted controls preload="metadata" /> : <div className="result-placeholder">等待处理结果</div>}
         </div>
-        <div className="compare-grid">
-          <PreviewCard title="Before" subtitle="原始帧">
-            <video className="result-video" src={videoUrl} muted preload="metadata" />
-          </PreviewCard>
-          <PreviewCard title="After" subtitle={outputUrl ? "导出结果" : "等待输出"}>
-            {outputUrl ? <video className="result-video" src={outputUrl} controls preload="metadata" /> : <div className="result-placeholder">处理完成后显示</div>}
-          </PreviewCard>
-          <PreviewCard title="Mask" subtitle="当前选区 mask 预览">
-            <div className="diagnostic-preview mask-diagnostic">{selection ? "MASK" : "未框选"}</div>
-          </PreviewCard>
-          <PreviewCard title="Frame repair" subtitle="当前帧修复预览">
-            <div className="diagnostic-preview repair-diagnostic">{outputUrl ? "已生成" : "等待处理"}</div>
-          </PreviewCard>
-        </div>
-      </section>
-    </>
-  );
-}
-
-function PreviewTab({ active, label, onClick }: { active: boolean; label: string; onClick: () => void }) {
-  return (
-    <button type="button" className={active ? "active" : ""} onClick={onClick}>
-      {label}
-    </button>
-  );
-}
-
-function PreviewCard({
-  title,
-  subtitle,
-  children
-}: {
-  title: string;
-  subtitle: string;
-  children: ReactNode;
-}) {
-  return (
-    <div className="compare-card">
-      <div>
-        <strong>{title}</strong>
-        <span>{subtitle}</span>
       </div>
-      {children}
-    </div>
+    </section>
   );
 }
 
 export function displayRectToVideoRect(displayRect: DisplayRect, videoElement: HTMLVideoElement): VideoRect {
-  const videoWidth = videoElement.videoWidth || 1;
-  const videoHeight = videoElement.videoHeight || 1;
-  const contained = getContainedVideoRect(videoElement);
-
-  const left = clamp(displayRect.x - contained.offsetX, 0, contained.displayedWidth);
-  const top = clamp(displayRect.y - contained.offsetY, 0, contained.displayedHeight);
-  const right = clamp(displayRect.x + displayRect.width - contained.offsetX, 0, contained.displayedWidth);
-  const bottom = clamp(displayRect.y + displayRect.height - contained.offsetY, 0, contained.displayedHeight);
-
-  const scaleX = videoWidth / Math.max(1, contained.displayedWidth);
-  const scaleY = videoHeight / Math.max(1, contained.displayedHeight);
-
-  const x = clamp(Math.round(Math.min(left, right) * scaleX), 0, Math.max(0, videoWidth - 1));
-  const y = clamp(Math.round(Math.min(top, bottom) * scaleY), 0, Math.max(0, videoHeight - 1));
-  const width = clamp(Math.round(Math.abs(right - left) * scaleX), 1, Math.max(1, videoWidth - x));
-  const height = clamp(Math.round(Math.abs(bottom - top) * scaleY), 1, Math.max(1, videoHeight - y));
-
-  return { x, y, width, height };
-}
-
-export function videoRectToDisplayRect(videoRect: VideoRect, videoElement: HTMLVideoElement): DisplayRect {
-  const videoWidth = videoElement.videoWidth || 1;
-  const videoHeight = videoElement.videoHeight || 1;
-  const contained = getContainedVideoRect(videoElement);
-
-  return {
-    x: contained.offsetX + (videoRect.x / videoWidth) * contained.displayedWidth,
-    y: contained.offsetY + (videoRect.y / videoHeight) * contained.displayedHeight,
-    width: (videoRect.width / videoWidth) * contained.displayedWidth,
-    height: (videoRect.height / videoHeight) * contained.displayedHeight
-  };
-}
-
-function getContainedVideoRect(videoElement: HTMLVideoElement): ContainedVideoRect {
+  const videoWidth = videoElement.videoWidth;
+  const videoHeight = videoElement.videoHeight;
   const bounds = videoElement.getBoundingClientRect();
-  const elementWidth = bounds.width || 1;
-  const elementHeight = bounds.height || 1;
-  const videoWidth = videoElement.videoWidth || elementWidth;
-  const videoHeight = videoElement.videoHeight || elementHeight;
-  const elementRatio = elementWidth / elementHeight;
-  const videoRatio = videoWidth / videoHeight;
 
-  let displayedWidth = elementWidth;
-  let displayedHeight = elementHeight;
+  if (videoWidth <= 0 || videoHeight <= 0 || bounds.width <= 0 || bounds.height <= 0) {
+    return { x: 0, y: 0, width: 0, height: 0 };
+  }
+
+  const videoAspect = videoWidth / videoHeight;
+  const boundsAspect = bounds.width / bounds.height;
+  let displayedWidth = bounds.width;
+  let displayedHeight = bounds.height;
   let offsetX = 0;
   let offsetY = 0;
 
-  if (elementRatio > videoRatio) {
-    displayedHeight = elementHeight;
-    displayedWidth = displayedHeight * videoRatio;
-    offsetX = (elementWidth - displayedWidth) / 2;
+  if (boundsAspect > videoAspect) {
+    displayedHeight = bounds.height;
+    displayedWidth = displayedHeight * videoAspect;
+    offsetX = (bounds.width - displayedWidth) / 2;
   } else {
-    displayedWidth = elementWidth;
-    displayedHeight = displayedWidth / videoRatio;
-    offsetY = (elementHeight - displayedHeight) / 2;
+    displayedWidth = bounds.width;
+    displayedHeight = displayedWidth / videoAspect;
+    offsetY = (bounds.height - displayedHeight) / 2;
   }
 
+  const left = clamp((displayRect.x - offsetX) / displayedWidth, 0, 1);
+  const top = clamp((displayRect.y - offsetY) / displayedHeight, 0, 1);
+  const right = clamp((displayRect.x + displayRect.width - offsetX) / displayedWidth, 0, 1);
+  const bottom = clamp((displayRect.y + displayRect.height - offsetY) / displayedHeight, 0, 1);
+
+  const x = Math.round(left * videoWidth);
+  const y = Math.round(top * videoHeight);
+  const width = Math.round((right - left) * videoWidth);
+  const height = Math.round((bottom - top) * videoHeight);
+
   return {
-    offsetX,
-    offsetY,
-    displayedWidth,
-    displayedHeight,
-    elementWidth,
-    elementHeight
+    x: clampInt(x, 0, videoWidth),
+    y: clampInt(y, 0, videoHeight),
+    width: clampInt(width, 0, videoWidth - x),
+    height: clampInt(height, 0, videoHeight - y)
   };
 }
 
-function constrainRectToVideo(rect: DisplayRect, videoElement: HTMLVideoElement): DisplayRect {
-  const contained = getContainedVideoRect(videoElement);
-  const minX = contained.offsetX;
-  const minY = contained.offsetY;
-  const maxX = contained.offsetX + contained.displayedWidth;
-  const maxY = contained.offsetY + contained.displayedHeight;
-  const left = clamp(rect.x, minX, maxX);
-  const top = clamp(rect.y, minY, maxY);
-  const right = clamp(rect.x + rect.width, minX, maxX);
-  const bottom = clamp(rect.y + rect.height, minY, maxY);
+function hitTest(point: { x: number; y: number }, rect: DisplayRect | null): { mode: DragMode; handle?: ResizeHandle } {
+  if (!rect) {
+    return { mode: "draw" };
+  }
 
-  return normalizeRect({ x: left, y: top }, { x: right, y: bottom });
+  const handles: Array<{ handle: ResizeHandle; x: number; y: number }> = [
+    { handle: "nw", x: rect.x, y: rect.y },
+    { handle: "ne", x: rect.x + rect.width, y: rect.y },
+    { handle: "sw", x: rect.x, y: rect.y + rect.height },
+    { handle: "se", x: rect.x + rect.width, y: rect.y + rect.height }
+  ];
+
+  for (const item of handles) {
+    if (Math.abs(point.x - item.x) <= 14 && Math.abs(point.y - item.y) <= 14) {
+      return { mode: "resize", handle: item.handle };
+    }
+  }
+
+  if (point.x >= rect.x && point.x <= rect.x + rect.width && point.y >= rect.y && point.y <= rect.y + rect.height) {
+    return { mode: "move" };
+  }
+
+  return { mode: "draw" };
 }
 
-function moveRect(rect: DisplayRect, deltaX: number, deltaY: number, videoElement: HTMLVideoElement): DisplayRect {
-  const contained = getContainedVideoRect(videoElement);
-  const minX = contained.offsetX;
-  const minY = contained.offsetY;
-  const maxX = contained.offsetX + contained.displayedWidth - rect.width;
-  const maxY = contained.offsetY + contained.displayedHeight - rect.height;
+function rectForInteraction(interaction: Interaction, point: { x: number; y: number }, maxWidth: number, maxHeight: number): DisplayRect {
+  if (interaction.mode === "draw") {
+    return clampDisplayRect(normalizeRect(interaction.startX, interaction.startY, point.x, point.y), maxWidth, maxHeight);
+  }
 
+  const origin = interaction.originRect ?? interaction.draftRect;
+  if (interaction.mode === "move") {
+    const dx = point.x - interaction.startX;
+    const dy = point.y - interaction.startY;
+    return clampDisplayRect({ ...origin, x: origin.x + dx, y: origin.y + dy }, maxWidth, maxHeight);
+  }
+
+  const left = origin.x;
+  const top = origin.y;
+  const right = origin.x + origin.width;
+  const bottom = origin.y + origin.height;
+
+  switch (interaction.handle) {
+    case "nw":
+      return clampDisplayRect(normalizeRect(point.x, point.y, right, bottom), maxWidth, maxHeight);
+    case "ne":
+      return clampDisplayRect(normalizeRect(left, point.y, point.x, bottom), maxWidth, maxHeight);
+    case "sw":
+      return clampDisplayRect(normalizeRect(point.x, top, right, point.y), maxWidth, maxHeight);
+    case "se":
+    default:
+      return clampDisplayRect(normalizeRect(left, top, point.x, point.y), maxWidth, maxHeight);
+  }
+}
+
+function clampDisplayRect(rect: DisplayRect, maxWidth: number, maxHeight: number): DisplayRect {
+  const width = Math.min(rect.width, maxWidth);
+  const height = Math.min(rect.height, maxHeight);
   return {
-    ...rect,
-    x: clamp(rect.x + deltaX, minX, Math.max(minX, maxX)),
-    y: clamp(rect.y + deltaY, minY, Math.max(minY, maxY))
+    x: clamp(rect.x, 0, maxWidth - width),
+    y: clamp(rect.y, 0, maxHeight - height),
+    width,
+    height
   };
 }
 
-function resizeRect(
-  rect: DisplayRect,
-  handle: DragHandle,
-  deltaX: number,
-  deltaY: number,
-  videoElement: HTMLVideoElement
-): DisplayRect {
-  const contained = getContainedVideoRect(videoElement);
-  const minX = contained.offsetX;
-  const minY = contained.offsetY;
-  const maxX = contained.offsetX + contained.displayedWidth;
-  const maxY = contained.offsetY + contained.displayedHeight;
-
-  let left = rect.x;
-  let top = rect.y;
-  let right = rect.x + rect.width;
-  let bottom = rect.y + rect.height;
-
-  if (handle.includes("w")) {
-    left = clamp(left + deltaX, minX, right - MIN_SELECTION_SIZE);
-  }
-  if (handle.includes("e")) {
-    right = clamp(right + deltaX, left + MIN_SELECTION_SIZE, maxX);
-  }
-  if (handle.includes("n")) {
-    top = clamp(top + deltaY, minY, bottom - MIN_SELECTION_SIZE);
-  }
-  if (handle.includes("s")) {
-    bottom = clamp(bottom + deltaY, top + MIN_SELECTION_SIZE, maxY);
-  }
-
-  return {
-    x: left,
-    y: top,
-    width: right - left,
-    height: bottom - top
-  };
-}
-
-function normalizeRect(start: Point, current: Point): DisplayRect {
-  const x = Math.min(start.x, current.x);
-  const y = Math.min(start.y, current.y);
+function normalizeRect(startX: number, startY: number, currentX: number, currentY: number): DisplayRect {
+  const x = Math.min(startX, currentX);
+  const y = Math.min(startY, currentY);
   return {
     x,
     y,
-    width: Math.abs(current.x - start.x),
-    height: Math.abs(current.y - start.y)
+    width: Math.abs(currentX - startX),
+    height: Math.abs(currentY - startY)
   };
 }
 
@@ -660,15 +480,6 @@ function roundDisplayRect(rect: DisplayRect): DisplayRect {
     width: Math.round(rect.width),
     height: Math.round(rect.height)
   };
-}
-
-function rectsNearlyEqual(a: DisplayRect, b: DisplayRect) {
-  return (
-    Math.abs(a.x - b.x) < 1 &&
-    Math.abs(a.y - b.y) < 1 &&
-    Math.abs(a.width - b.width) < 1 &&
-    Math.abs(a.height - b.height) < 1
-  );
 }
 
 function rectStyle(rect: DisplayRect) {
@@ -684,12 +495,16 @@ function clamp(value: number, min: number, max: number) {
   return Math.max(min, Math.min(max, value));
 }
 
+function clampInt(value: number, min: number, max: number) {
+  return Math.round(clamp(value, min, max));
+}
+
 function formatTime(seconds: number) {
-  if (!Number.isFinite(seconds) || seconds < 0) {
+  if (!Number.isFinite(seconds) || seconds <= 0) {
     return "00:00";
   }
-  const totalSeconds = Math.floor(seconds);
-  const minutes = Math.floor(totalSeconds / 60);
-  const remaining = totalSeconds % 60;
-  return `${String(minutes).padStart(2, "0")}:${String(remaining).padStart(2, "0")}`;
+  const whole = Math.floor(seconds);
+  const mins = Math.floor(whole / 60);
+  const secs = whole % 60;
+  return `${String(mins).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
 }

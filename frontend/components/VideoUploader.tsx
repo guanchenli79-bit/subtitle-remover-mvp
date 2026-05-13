@@ -9,14 +9,9 @@ export type UploadedVideo = {
   height: number;
   duration: number;
   fps: number;
-  size: number;
-  preview_url: string;
-};
-
-type UploadResponse = Omit<UploadedVideo, "preview_url" | "size"> & {
-  size?: number;
-  video_width?: number;
-  video_height?: number;
+  previewUrl: string;
+  fileSize: number;
+  mimeType: string;
 };
 
 type Props = {
@@ -27,34 +22,27 @@ type Props = {
 
 export function VideoUploader({ apiBaseUrl, video, onUploaded }: Props) {
   const inputRef = useRef<HTMLInputElement | null>(null);
-  const [selectedName, setSelectedName] = useState<string>("未选择文件");
-  const [selectedSize, setSelectedSize] = useState<number | null>(null);
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [isUploading, setIsUploading] = useState(false);
-  const [message, setMessage] = useState<string | null>(null);
+  const [message, setMessage] = useState<string>("选择一个视频开始");
 
   function handleFileChange(event: ChangeEvent<HTMLInputElement>) {
-    const file = event.target.files?.[0];
-    if (!file) {
-      return;
-    }
-
-    setSelectedName(file.name);
-    setSelectedSize(file.size);
-    setMessage(null);
+    const file = event.target.files?.[0] ?? null;
+    setSelectedFile(file);
+    setMessage(file ? `${file.name} · ${formatBytes(file.size)}` : "选择一个视频开始");
   }
 
   async function uploadSelected() {
-    const file = inputRef.current?.files?.[0];
-    if (!file) {
+    if (!selectedFile) {
       setMessage("请选择 mp4、mov 或 webm 视频");
       return;
     }
 
     const formData = new FormData();
-    formData.append("file", file);
+    formData.append("file", selectedFile);
 
     setIsUploading(true);
-    setMessage("上传中");
+    setMessage("正在上传并分析视频");
     try {
       const response = await fetch(`${apiBaseUrl}/api/upload`, {
         method: "POST",
@@ -66,16 +54,15 @@ export function VideoUploader({ apiBaseUrl, video, onUploaded }: Props) {
         throw new Error(payload?.detail ?? "上传失败");
       }
 
-      const uploaded = (await response.json()) as UploadResponse;
-      const previewUrl = URL.createObjectURL(file);
+      const uploaded = (await response.json()) as Omit<UploadedVideo, "previewUrl" | "fileSize" | "mimeType">;
+      const previewUrl = URL.createObjectURL(selectedFile);
       onUploaded({
         ...uploaded,
-        width: uploaded.video_width ?? uploaded.width,
-        height: uploaded.video_height ?? uploaded.height,
-        size: uploaded.size ?? file.size,
-        preview_url: previewUrl
+        previewUrl,
+        fileSize: selectedFile.size,
+        mimeType: selectedFile.type
       });
-      setMessage(`${uploaded.width} x ${uploaded.height} · ${uploaded.fps} fps`);
+      setMessage("上传完成，可以框选字幕区域");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "上传失败");
     } finally {
@@ -84,10 +71,10 @@ export function VideoUploader({ apiBaseUrl, video, onUploaded }: Props) {
   }
 
   return (
-    <section className="panel upload-panel">
-      <div className="panel-heading">
-        <span className="eyebrow">Source</span>
-        <h2>视频文件</h2>
+    <section className="tool-card upload-card">
+      <div className="card-title">
+        <span>素材</span>
+        <small>MP4 / MOV / WEBM，最大 500MB</small>
       </div>
 
       <input
@@ -98,35 +85,28 @@ export function VideoUploader({ apiBaseUrl, video, onUploaded }: Props) {
         onChange={handleFileChange}
       />
 
-      <button type="button" className="upload-drop" onClick={() => inputRef.current?.click()}>
-        <span className="upload-icon">+</span>
-        <strong>选择视频</strong>
-        <small>MP4 / MOV / WEBM · 最大 500MB</small>
-      </button>
-
-      <div className="file-summary">
-        <div className="file-thumb">▶</div>
-        <div>
-          <strong>{video?.filename ?? selectedName}</strong>
-          <span>{video ? `${video.width} x ${video.height}` : selectedSize ? formatBytes(selectedSize) : "等待上传"}</span>
-        </div>
+      <div className="upload-actions">
+        <button type="button" className="ghost-button" onClick={() => inputRef.current?.click()}>
+          选择视频
+        </button>
+        <button type="button" className="primary-button" disabled={isUploading || !selectedFile} onClick={uploadSelected}>
+          {isUploading ? "上传中" : "上传视频"}
+        </button>
       </div>
 
-      <button type="button" className="primary-button full-width" disabled={isUploading} onClick={uploadSelected}>
-        {isUploading ? "上传中" : "上传并创建本地预览"}
-      </button>
-
-      <div className="status-line">{message ? <span>{message}</span> : null}</div>
+      <div className="upload-status">
+        <strong>{video?.filename ?? selectedFile?.name ?? "未选择文件"}</strong>
+        <span>{message}</span>
+      </div>
     </section>
   );
 }
 
 function formatBytes(bytes: number) {
-  if (bytes <= 0) {
+  if (bytes === 0) {
     return "0 B";
   }
   const units = ["B", "KB", "MB", "GB"];
   const index = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
-  const value = bytes / 1024 ** index;
-  return `${value.toFixed(value >= 10 || index === 0 ? 0 : 1)} ${units[index]}`;
+  return `${(bytes / 1024 ** index).toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
 }

@@ -15,6 +15,7 @@ DATA_DIR = BASE_DIR / "data"
 UPLOAD_DIR = DATA_DIR / "uploads"
 OUTPUT_DIR = DATA_DIR / "outputs"
 WORK_DIR = DATA_DIR / "work"
+PREVIEW_DIR = DATA_DIR / "previews"
 
 MAX_UPLOAD_SIZE = 500 * 1024 * 1024
 ALLOWED_EXTENSIONS = {".mp4", ".mov", ".webm"}
@@ -25,7 +26,7 @@ class StorageError(ValueError):
 
 
 def ensure_dirs() -> None:
-    for directory in (UPLOAD_DIR, OUTPUT_DIR, WORK_DIR):
+    for directory in (UPLOAD_DIR, OUTPUT_DIR, WORK_DIR, PREVIEW_DIR):
         directory.mkdir(parents=True, exist_ok=True)
 
 
@@ -49,6 +50,11 @@ def metadata_path(video_id: str) -> Path:
 
 def output_path(job_id: str) -> Path:
     return OUTPUT_DIR / f"{job_id}.mp4"
+
+
+def preview_path(filename: str) -> Path:
+    ensure_dirs()
+    return PREVIEW_DIR / filename
 
 
 def work_path(job_id: str) -> Path:

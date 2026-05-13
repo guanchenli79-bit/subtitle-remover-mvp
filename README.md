@@ -1,6 +1,6 @@
 # 视频去字幕工具 MVP
 
-一个可部署到 Railway 的在线视频去字幕工具 MVP。用户上传视频后，在 HTML5 video 预览画面上框选字幕区域，后端使用 OpenCV 只对框选区域内检测到的文字像素生成 mask，并用 `cv2.inpaint` 修复，最后用 FFmpeg 合成 mp4 并保留原视频音频。
+一个可部署到 Railway 的在线视频去字幕工具 MVP。用户上传视频后，在 HTML5 video 预览画面上框选字幕区域，后端生成文字级字幕 mask，并按 `fast / balanced / high_quality` 三档选择 OpenCV、Temporal OpenCV、ProPainter 或 LaMa fallback 修复，最后用 FFmpeg 合成 mp4 并保留原视频音频。
 
 ## 当前部署形态
 
@@ -38,9 +38,48 @@ railway.json
 PORT=8000
 NEXT_PUBLIC_API_BASE_URL=
 CORS_ALLOW_ORIGINS=
+ENABLE_PROPAINTER=false
+PROPAINTER_PATH=/app/models/propainter
+PROPAINTER_DEVICE=cpu
+ENABLE_LAMA=false
+LAMA_MODEL_PATH=/app/models/lama
+LAMA_DEVICE=cpu
 ```
 
 单容器部署时 `NEXT_PUBLIC_API_BASE_URL` 留空，前端会请求同域名下的 `/api`。如果以后拆成前后端两个服务，再把它设成后端公网地址。
+
+## V4 修复模式
+
+- `fast`：OpenCV inpaint，速度优先，适合快速预览。
+- `balanced`：默认模式，文字级 mask + 前后帧 Temporal OpenCV 融合 + OpenCV 边缘收口。
+- `high_quality`：优先 ProPainter；没有 ProPainter 时尝试 LaMa；二者不可用时自动 fallback 到 Temporal OpenCV。
+
+Railway 普通 CPU 环境默认不会下载或安装 ProPainter/LaMa 大模型，网站仍可启动并使用 `balanced`。如果要启用模型，需要自行把模型目录挂载或打包到镜像外部存储，并设置：
+
+```bash
+ENABLE_PROPAINTER=true
+PROPAINTER_PATH=/app/models/propainter
+PROPAINTER_DEVICE=cuda
+```
+
+或：
+
+```bash
+ENABLE_LAMA=true
+LAMA_MODEL_PATH=/app/models/lama
+LAMA_DEVICE=cpu
+```
+
+页面会显示当前实际使用的修复引擎：`ProPainter`、`LaMa`、`Temporal OpenCV` 或 `OpenCV`，不会在未启用模型时假装使用 ProPainter。
+
+## 预览接口
+
+V4 增加了两个轻量预览接口：
+
+- `POST /api/preview-mask`：返回当前帧 mask overlay 图、mask 覆盖率、组件数量和 warning。
+- `POST /api/preview-repair-frame`：只修复当前时间点的一帧，返回 before / after 图片和实际预览引擎。
+
+前端右侧「预览工具」里有 **预览 mask** 和 **预览当前帧修复** 两个按钮。
 
 ## 本地 Docker 运行
 
@@ -145,5 +184,5 @@ NEXT_PUBLIC_API_BASE_URL=https://subtitle-backend.up.railway.app
 - 仅允许 `mp4`、`mov`、`webm`。
 - 任务进度保存在内存中，重启后会丢失。
 - 本地文件存储在容器文件系统内，Railway 重新部署后历史上传和输出文件不会保留。
-- 第一版重点是文字像素 mask + OpenCV inpaint，不做复杂 OCR 和队列系统。
+- V4 默认重点是文字级 mask + Temporal OpenCV；ProPainter/LaMa 为可选模型能力，不做复杂账号、付费或队列系统。
 - 请只处理自己拥有版权或获得授权的视频。

@@ -1,52 +1,58 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { ProcessingPanel, type ProcessOptions, type ProgressState } from "../components/ProcessingPanel";
-import { VideoAnnotator, type SelectionState, type VideoMetadata } from "../components/VideoAnnotator";
+import { ProcessingPanel, type MaskPreview, type ProcessOptions, type ProgressState } from "../components/ProcessingPanel";
+import { VideoAnnotator, type DisplayRect, type RepairPreview, type VideoMetadata, type VideoRect } from "../components/VideoAnnotator";
 import { VideoUploader, type UploadedVideo } from "../components/VideoUploader";
 
 const RAW_API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? "";
 const API_BASE_URL = RAW_API_BASE_URL.replace(/\/+$/, "");
 
-const STRENGTH_TO_RADIUS: Record<ProcessOptions["inpaint_strength"], number> = {
-  low: 2,
-  medium: 3,
-  high: 5
-};
-
 export default function Home() {
   const [video, setVideo] = useState<UploadedVideo | null>(null);
-  const [selection, setSelection] = useState<SelectionState | null>(null);
+  const [displayRect, setDisplayRect] = useState<DisplayRect | null>(null);
+  const [videoRect, setVideoRect] = useState<VideoRect | null>(null);
   const [jobId, setJobId] = useState<string | null>(null);
   const [progress, setProgress] = useState<ProgressState | null>(null);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [maskPreview, setMaskPreview] = useState<MaskPreview | null>(null);
+  const [repairPreview, setRepairPreview] = useState<RepairPreview | null>(null);
+  const [showMaskOverlay, setShowMaskOverlay] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     return () => {
-      if (video?.preview_url) {
-        URL.revokeObjectURL(video.preview_url);
+      if (video?.previewUrl) {
+        URL.revokeObjectURL(video.previewUrl);
       }
     };
-  }, [video?.preview_url]);
+  }, [video?.previewUrl]);
 
-  const outputUrl = useMemo(() => {
-    if (!progress?.download_url || !["completed", "done"].includes(progress.status)) {
+  const downloadUrl = useMemo(() => {
+    if (progress?.status !== "done" || !progress.download_url) {
       return null;
     }
     return `${API_BASE_URL}${progress.download_url}`;
   }, [progress]);
 
   function handleUploaded(uploaded: UploadedVideo) {
-    setVideo((current) => {
-      if (current?.preview_url) {
-        URL.revokeObjectURL(current.preview_url);
-      }
-      return uploaded;
-    });
-    setSelection(null);
+    if (video?.previewUrl) {
+      URL.revokeObjectURL(video.previewUrl);
+    }
+    setVideo(uploaded);
+    setDisplayRect(null);
+    setVideoRect(null);
     setJobId(null);
-    setProgress({ status: "upload", progress: 0.05, stage_progress: 1, message: "视频已上传，正在读取本地预览", download_url: null });
+    setCurrentTime(0);
+    setMaskPreview(null);
+    setRepairPreview(null);
+    setProgress({ status: "idle", step: "uploaded", progress: 0.02, message: "上传完成", download_url: null });
     setError(null);
+  }
+
+  function handleSelectionChange(nextDisplayRect: DisplayRect | null, nextVideoRect: VideoRect | null) {
+    setDisplayRect(nextDisplayRect);
+    setVideoRect(nextVideoRect);
   }
 
   function handleVideoMetadata(metadata: VideoMetadata) {
@@ -63,26 +69,13 @@ export default function Home() {
     });
   }
 
-  function handleCancel() {
-    setJobId(null);
-    setProgress((current) =>
-      current && !["completed", "done", "canceled", "failed"].includes(current.status)
-        ? { ...current, status: "canceled", message: "正在取消任务" }
-        : current
-    );
-    if (jobId) {
-      fetch(`${API_BASE_URL}/api/cancel/${jobId}`, { method: "POST" }).catch(() => undefined);
-    }
-  }
-
   async function startProcessing(options: ProcessOptions) {
-    if (!video || !selection) {
+    if (!video || !videoRect) {
       return;
     }
 
-    const rect = selection.videoRect;
     setError(null);
-    setProgress({ status: "upload", progress: 0.08, stage_progress: 1, message: "任务已提交", download_url: null });
+    setProgress({ status: "processing", step: "uploaded", progress: 0.03, message: "提交任务中", download_url: null });
 
     const response = await fetch(`${API_BASE_URL}/api/process`, {
       method: "POST",
@@ -91,36 +84,18 @@ export default function Home() {
       },
       body: JSON.stringify({
         video_id: video.video_id,
-        rect,
-        x: rect.x,
-        y: rect.y,
-        width: rect.width,
-        height: rect.height,
+        x: videoRect.x,
+        y: videoRect.y,
+        width: videoRect.width,
+        height: videoRect.height,
         video_width: video.width,
         video_height: video.height,
-        inpaint_strength: options.inpaint_strength,
-        repair_mode: options.repair_mode,
-        detection_sensitivity: options.detection_sensitivity,
-        temporal_window: options.temporal_window,
-        min_component_area: options.min_component_area,
-        max_component_area: options.max_component_area,
-        mask_dilate: options.mask_dilate,
-        feather_radius: options.feather_radius,
-        ocr_confirm: options.ocr_confirm,
-        keep_audio: options.keep_audio,
-        options: {
-          inpaint_strength: options.inpaint_strength,
-          repair_mode: options.repair_mode,
-          detection_sensitivity: options.detection_sensitivity,
-          temporal_window: options.temporal_window,
-          min_component_area: options.min_component_area,
-          max_component_area: options.max_component_area,
-          mask_dilate: options.mask_dilate,
-          feather_radius: options.feather_radius,
-          ocr_confirm: options.ocr_confirm,
-          keep_audio: options.keep_audio,
-          inpaint_radius: STRENGTH_TO_RADIUS[options.inpaint_strength]
-        }
+        rect: {
+          ...videoRect,
+          video_width: video.width,
+          video_height: video.height
+        },
+        options
       })
     });
 
@@ -129,14 +104,65 @@ export default function Home() {
       throw new Error(payload?.detail ?? "处理任务提交失败");
     }
 
-    const payload = (await response.json()) as { job_id: string; status: ProgressState["status"] };
+    const payload = (await response.json()) as { job_id: string; status: string; engine?: string };
     setJobId(payload.job_id);
-    setProgress({
-      status: payload.status ?? "uploaded",
-      progress: 0.1,
-      stage_progress: 0,
-      message: "后端已接收处理任务",
-      download_url: null
+    if (payload.engine) {
+      setProgress((current) => current ? { ...current, engine: payload.engine } : current);
+    }
+  }
+
+  async function cancelJob(targetJobId: string) {
+    const response = await fetch(`${API_BASE_URL}/api/cancel/${targetJobId}`, {
+      method: "POST"
+    });
+    if (!response.ok) {
+      const payload = await response.json().catch(() => null);
+      throw new Error(payload?.detail ?? "取消失败");
+    }
+    const payload = (await response.json()) as ProgressState;
+    setProgress(payload);
+  }
+
+  async function previewMask(options: ProcessOptions) {
+    if (!video || !videoRect) {
+      return;
+    }
+    const response = await fetch(`${API_BASE_URL}/api/preview-mask`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(buildPreviewPayload(video, videoRect, currentTime, options))
+    });
+    if (!response.ok) {
+      const payload = await response.json().catch(() => null);
+      throw new Error(payload?.detail ?? "mask 预览失败");
+    }
+    const payload = (await response.json()) as MaskPreview;
+    setMaskPreview({
+      ...payload,
+      mask_preview_url: `${API_BASE_URL}${payload.mask_preview_url}`,
+      debug_overlay_url: payload.debug_overlay_url ? `${API_BASE_URL}${payload.debug_overlay_url}` : undefined
+    });
+    setShowMaskOverlay(true);
+  }
+
+  async function previewRepair(options: ProcessOptions) {
+    if (!video || !videoRect) {
+      return;
+    }
+    const response = await fetch(`${API_BASE_URL}/api/preview-repair-frame`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(buildPreviewPayload(video, videoRect, currentTime, options))
+    });
+    if (!response.ok) {
+      const payload = await response.json().catch(() => null);
+      throw new Error(payload?.detail ?? "当前帧修复预览失败");
+    }
+    const payload = (await response.json()) as RepairPreview & { before_url: string; after_url: string };
+    setRepairPreview({
+      ...payload,
+      before_url: `${API_BASE_URL}${payload.before_url}`,
+      after_url: `${API_BASE_URL}${payload.after_url}`
     });
   }
 
@@ -144,59 +170,95 @@ export default function Home() {
     <main className="app-shell">
       <header className="app-header">
         <div className="brand">
-          <div className="brand-mark">SR</div>
+          <div className="brand-mark">VS</div>
           <div>
-            <strong>Subtitle Remover</strong>
-            <span>视频去字幕处理台</span>
+            <strong>视频去字幕工具</strong>
+            <span>本地处理管线 · ROI mask · Inpaint</span>
           </div>
         </div>
-        <div className="header-status">
-          <span>{video ? `${video.width} x ${video.height}` : "等待上传"}</span>
-          <strong>{selection ? "已选择字幕区域" : "未选择区域"}</strong>
+        <div className="header-meta">
+          <span>Railway 单服务部署</span>
+          <span>请只处理自己拥有版权或有授权的视频</span>
         </div>
       </header>
 
+      <section className="top-status-bar">
+        <span>当前文件：{video?.filename ?? "-"}</span>
+        <span>分辨率：{video ? `${video.width}×${video.height}` : "-"}</span>
+        <span>时长：{video ? `${video.duration.toFixed(1)}s` : "-"}</span>
+        <span>当前模式：{progress?.engine ?? "Temporal OpenCV"}</span>
+        <span>进度：{progress ? `${Math.round(progress.progress * 100)}%` : "0%"}</span>
+      </section>
+
       <div className="workspace-grid">
-        <section className="left-column">
+        <section className="left-pane">
           {video ? (
             <VideoAnnotator
-              key={video.video_id}
               video={video}
-              videoUrl={video.preview_url}
-              outputUrl={outputUrl}
-              selection={selection}
-              onSelectionChange={setSelection}
+              videoUrl={video.previewUrl}
+              outputUrl={downloadUrl}
+              maskPreviewUrl={maskPreview?.mask_preview_url ?? null}
+              showMaskOverlay={showMaskOverlay}
+              repairPreview={repairPreview}
+              displayRect={displayRect}
+              videoRect={videoRect}
+              onSelectionChange={handleSelectionChange}
               onVideoMetadata={handleVideoMetadata}
+              onTimeChange={setCurrentTime}
+              onToggleMaskOverlay={() => setShowMaskOverlay((value) => !value)}
             />
           ) : (
-            <section className="viewer-panel empty-viewer">
+            <section className="video-workbench empty-workbench">
               <div>
-                <span className="eyebrow">Preview</span>
-                <h1>上传视频后开始处理</h1>
-                <p>左侧会显示本地 HTML5 视频预览，可播放、暂停、拖动时间轴并框选字幕区域。</p>
+                <h1>上传视频后开始预览与框选</h1>
+                <p>支持横屏与竖屏视频，预览区会按原始比例完整显示。</p>
               </div>
             </section>
           )}
         </section>
 
-        <section className="right-column">
+        <aside className="right-pane">
           <VideoUploader apiBaseUrl={API_BASE_URL} video={video} onUploaded={handleUploaded} />
           <ProcessingPanel
             apiBaseUrl={API_BASE_URL}
             video={video}
-            selection={selection}
+            displayRect={displayRect}
+            videoRect={videoRect}
+            currentTime={currentTime}
+            maskPreview={maskPreview}
+            repairPreview={repairPreview}
             jobId={jobId}
             progress={progress}
             onProgress={setProgress}
-            onResetSelection={() => setSelection(null)}
             onStart={startProcessing}
-            onCancel={handleCancel}
+            onCancel={cancelJob}
+            onPreviewMask={previewMask}
+            onPreviewRepair={previewRepair}
             onError={setError}
           />
-        </section>
+        </aside>
       </div>
 
       {error ? <div className="toast error">{error}</div> : null}
     </main>
   );
+}
+
+function buildPreviewPayload(video: UploadedVideo, rect: VideoRect, time: number, options: ProcessOptions) {
+  return {
+    video_id: video.video_id,
+    time,
+    x: rect.x,
+    y: rect.y,
+    width: rect.width,
+    height: rect.height,
+    video_width: video.width,
+    video_height: video.height,
+    rect: {
+      ...rect,
+      video_width: video.width,
+      video_height: video.height
+    },
+    options
+  };
 }
