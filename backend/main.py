@@ -229,11 +229,14 @@ def _job_status_response(job_id: str) -> dict:
         "message": job["message"],
         "current_frame": job["current_frame"],
         "total_frames": job["total_frames"],
+        "warning": job["warning"],
         "error": job["error"],
         "output_url": job["output_url"],
         "download_url": job["download_url"],
         "engine": job.get("engine"),
         "updated_at": job["updated_at"],
+        "last_update": job["last_update"],
+        "last_progress_at": job["last_progress_at"],
     }
 
 
@@ -251,11 +254,14 @@ def cancel(job_id: str) -> dict:
         "message": job["message"],
         "current_frame": job["current_frame"],
         "total_frames": job["total_frames"],
+        "warning": job["warning"],
         "error": job["error"],
         "output_url": job["output_url"],
         "download_url": job["download_url"],
         "engine": job.get("engine"),
         "updated_at": job["updated_at"],
+        "last_update": job["last_update"],
+        "last_progress_at": job["last_progress_at"],
     }
 
 

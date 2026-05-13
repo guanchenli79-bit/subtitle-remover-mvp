@@ -193,6 +193,11 @@ export default function Home() {
     }
     setIsAutoDetecting(true);
     setError(null);
+    setProgress((current) =>
+      current
+        ? { ...current, step: "auto_detecting", stage: "auto_detecting", message: "自动识别字幕区域中" }
+        : { status: "idle", step: "auto_detecting", stage: "auto_detecting", progress: 0.02, message: "自动识别字幕区域中", download_url: null }
+    );
     try {
       const response = await fetch(`${API_BASE_URL}/api/auto-detect-subtitle-region`, {
         method: "POST",
@@ -213,7 +218,7 @@ export default function Home() {
       });
       setAutoRect(payload.recommended_rect);
       setVideoRect(payload.recommended_rect);
-      setProgress((current) => current ? { ...current, message: payload.reason } : current);
+      setProgress((current) => current ? { ...current, step: "uploaded", stage: "uploaded", message: payload.reason } : current);
     } finally {
       setIsAutoDetecting(false);
     }

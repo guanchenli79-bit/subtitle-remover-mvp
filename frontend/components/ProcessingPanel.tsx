@@ -27,16 +27,21 @@ export type ProgressState = {
   message: string;
   current_frame?: number;
   total_frames?: number;
+  warning?: string | null;
   error?: string | null;
   output_url?: string | null;
   download_url?: string | null;
   engine?: string | null;
   updated_at?: number;
+  last_update?: number;
+  last_progress_at?: number;
 };
 
 export type ProgressStage =
   | "uploaded"
   | "probing"
+  | "reading_video"
+  | "auto_detecting"
   | "detecting_masks"
   | "extracting_frames"
   | "repairing_frames"
@@ -339,6 +344,8 @@ export function ProcessingPanel({
   const engineHint = getEngineHint(options.repair_mode, actualEngine, engineStatus);
   const frameText = frameProgressText(progress);
   const lastUpdateText = lastProgressAt ? formatLastUpdated(lastProgressAt, clock) : "-";
+  const noProgressWarning = getNoProgressWarning(progress, clock);
+  const resourceWarning = getResourceWarning(video);
 
   return (
     <div className="control-stack">
@@ -429,6 +436,9 @@ export function ProcessingPanel({
           <div className="progress-fill" style={{ width: `${percentage}%` }} />
         </div>
         {pollMessage ? <div className={`poll-warning ${pollFailureCount > 3 ? "unstable" : ""}`}>{pollMessage}</div> : null}
+        {noProgressWarning ? <div className="soft-warning">{noProgressWarning}</div> : null}
+        {progress?.warning ? <div className="soft-warning">{progress.warning}</div> : null}
+        {resourceWarning ? <div className="soft-warning">{resourceWarning}</div> : null}
         {autoDetectResult?.warning ? <div className="soft-warning">{autoDetectResult.warning}</div> : null}
         {maskPreview?.warning ? <div className="soft-warning">{maskPreview.warning}</div> : null}
         <InfoGrid
@@ -605,6 +615,31 @@ function frameProgressText(progress: ProgressState | null) {
   return `${progress.current_frame ?? 0} / ${progress.total_frames}`;
 }
 
+function getNoProgressWarning(progress: ProgressState | null, now: number) {
+  if (!progress || progress.status !== "processing" || !progress.last_progress_at) {
+    return null;
+  }
+  const seconds = Math.max(0, Math.round((now - progress.last_progress_at * 1000) / 1000));
+  if (seconds < 60) {
+    return null;
+  }
+  return "处理无进展，建议取消后使用更短视频或速度优先模式。";
+}
+
+function getResourceWarning(video: UploadedVideo | null) {
+  if (!video) {
+    return null;
+  }
+  const warnings: string[] = [];
+  if (video.duration > 20) {
+    warnings.push("Railway CPU 模式下，超过 20 秒的视频建议先裁剪后处理。");
+  }
+  if (video.width > 1920 || video.height > 1080) {
+    warnings.push("视频分辨率超过 1080p，处理可能很慢。");
+  }
+  return warnings.length ? warnings.join(" ") : null;
+}
+
 function formatLastUpdated(lastProgressAt: number, now: number) {
   const seconds = Math.max(0, Math.round((now - lastProgressAt) / 1000));
   return seconds <= 1 ? "刚刚" : `${seconds} 秒前`;
@@ -614,6 +649,8 @@ function stepLabel(step: ProgressStage) {
   const labels: Record<ProgressStage, string> = {
     uploaded: "上传完成",
     probing: "读取视频",
+    reading_video: "读取视频",
+    auto_detecting: "自动识别字幕",
     detecting_masks: "生成字幕 mask",
     extracting_frames: "拆帧",
     repairing_frames: "修复画面",

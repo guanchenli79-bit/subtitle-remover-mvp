@@ -15,6 +15,7 @@ class JobState:
     message: str
     current_frame: int = 0
     total_frames: int = 0
+    warning: str | None = None
     error: str | None = None
     output_url: str | None = None
     download_url: str | None = None
@@ -22,6 +23,7 @@ class JobState:
     cancel_requested: bool = False
     created_at: float = 0.0
     updated_at: float = 0.0
+    last_progress_at: float = 0.0
 
 
 _jobs: dict[str, JobState] = {}
@@ -39,6 +41,7 @@ def create_job(message: str = "Waiting to start") -> JobState:
         message=message,
         created_at=now,
         updated_at=now,
+        last_progress_at=now,
     )
     with _lock:
         _jobs[job_id] = job
@@ -54,6 +57,7 @@ def update_job(
     message: str | None = None,
     current_frame: int | None = None,
     total_frames: int | None = None,
+    warning: str | None = None,
     error: str | None = None,
     output_url: str | None = None,
     download_url: str | None = None,
@@ -61,6 +65,10 @@ def update_job(
 ) -> None:
     with _lock:
         job = _jobs[job_id]
+        now = time()
+        previous_frame = job.current_frame
+        previous_step = job.step
+        previous_progress = job.progress
         if status is not None:
             job.status = status
         if step is not None:
@@ -73,6 +81,8 @@ def update_job(
             job.current_frame = max(0, current_frame)
         if total_frames is not None:
             job.total_frames = max(0, total_frames)
+        if warning is not None:
+            job.warning = warning
         if error is not None:
             job.error = error
         if output_url is not None:
@@ -85,9 +95,22 @@ def update_job(
             job.engine = engine
         if status == "failed" and job.error is None:
             job.error = job.message
+        if status == "failed":
+            job.warning = None
         if status in {"processing", "completed", "done", "cancelled"}:
             job.error = None
-        job.updated_at = time()
+        progressed = (
+            (current_frame is not None and job.current_frame != previous_frame)
+            or (step is not None and job.step != previous_step)
+            or (progress is not None and job.progress > previous_progress)
+        )
+        if progressed:
+            job.last_progress_at = now
+            if warning is None:
+                job.warning = None
+        if status in {"failed", "completed", "done", "cancelled"}:
+            job.last_progress_at = now
+        job.updated_at = now
 
 
 def request_cancel(job_id: str) -> dict:
@@ -98,7 +121,10 @@ def request_cancel(job_id: str) -> dict:
         job.cancel_requested = True
         if job.status == "processing":
             job.message = "Cancel requested"
-            job.updated_at = time()
+            job.warning = "任务正在取消，将在当前处理片段结束后停止。"
+            now = time()
+            job.updated_at = now
+            job.last_progress_at = now
         return _snapshot(job)
 
 
@@ -113,6 +139,7 @@ def get_job(job_id: str) -> dict:
         job = _jobs.get(job_id)
         if job is None:
             raise KeyError(job_id)
+        _apply_stall_policy(job)
         return _snapshot(job)
 
 
@@ -121,4 +148,25 @@ def _snapshot(job: JobState) -> dict:
     payload["stage"] = job.step
     payload["output_url"] = job.output_url or job.download_url
     payload["download_url"] = job.download_url or job.output_url
+    payload["last_update"] = job.updated_at
     return payload
+
+
+def _apply_stall_policy(job: JobState) -> None:
+    if job.status != "processing":
+        return
+
+    now = time()
+    stalled_seconds = now - job.last_progress_at
+    if stalled_seconds >= 180:
+        job.status = "failed"
+        job.step = "failed"
+        job.cancel_requested = True
+        job.error = "处理超过 180 秒无进展，请尝试更短视频或速度优先模式。"
+        job.message = job.error
+        job.warning = None
+        job.updated_at = now
+        return
+
+    if stalled_seconds >= 60:
+        job.warning = "处理可能卡住，请尝试更短视频或速度优先模式。"

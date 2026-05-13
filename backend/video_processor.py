@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from time import sleep
 from uuid import uuid4
 
 import cv2
@@ -10,6 +11,10 @@ import jobs
 import storage
 from inpaint_engines import choose_engine, get_engine_capabilities, repair_frame, repair_video
 from mask_detector import MaskDetectionResult, detect_subtitle_mask, mask_to_full_frame
+
+
+class JobCancelled(RuntimeError):
+    pass
 
 
 def probe_video(video_path: Path) -> dict:
@@ -54,14 +59,16 @@ def process_video(
     work_dir: Path | None = None
 
     try:
+        mode = str(options.get("repair_mode", "balanced")).lower()
         jobs.update_job(
             job_id,
-            step="probing",
+            step="reading_video",
             progress=0.03,
-            message="读取视频",
+            message="准备读取视频",
             current_frame=0,
             total_frames=0,
-            engine=choose_engine(options.get("repair_mode", "balanced")),
+            warning=_performance_warning_from_metadata(None),
+            engine=choose_engine(mode),
         )
         original_path = storage.get_upload_path(video_id)
         metadata = storage.read_video_metadata(video_id)
@@ -71,19 +78,42 @@ def process_video(
 
         fps = float(capture.get(cv2.CAP_PROP_FPS) or metadata["fps"] or 25)
         total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or metadata.get("frame_count") or 0)
-        jobs.update_job(job_id, step="probing", progress=0.04, message="读取视频", current_frame=0, total_frames=total_frames)
+        jobs.update_job(
+            job_id,
+            step="reading_video",
+            progress=0.04,
+            message=f"读取视频 0/{total_frames or '?'}",
+            current_frame=0,
+            total_frames=total_frames,
+            warning=_performance_warning_from_metadata(metadata),
+        )
         frames: list[np.ndarray] = []
-        while True:
-            ok, frame = capture.read()
-            if not ok:
-                break
-            frames.append(frame)
-        capture.release()
+        try:
+            while True:
+                _raise_if_cancelled(job_id)
+                ok, frame = capture.read()
+                if not ok:
+                    break
+                _raise_if_cancelled(job_id)
+                frames.append(frame)
+                decoded = len(frames)
+                if decoded % 5 == 0 or decoded == total_frames:
+                    denominator = total_frames or decoded
+                    jobs.update_job(
+                        job_id,
+                        step="reading_video",
+                        progress=0.04 + min(decoded / max(1, denominator), 1.0) * 0.04,
+                        message=f"读取视频 {decoded}/{denominator}",
+                        current_frame=decoded,
+                        total_frames=denominator,
+                    )
+                    sleep(0)
+        finally:
+            capture.release()
 
         if not frames:
             raise RuntimeError("No frames were decoded from the uploaded video")
 
-        mode = str(options.get("repair_mode", "balanced")).lower()
         keep_audio = bool(options.get("keep_audio", True))
         work_dir = storage.create_work_dir(job_id)
 
@@ -93,9 +123,7 @@ def process_video(
         reference_mask: np.ndarray | None = None
         jobs.update_job(job_id, step="detecting_masks", progress=0.08, message="生成字幕 mask", current_frame=0, total_frames=total)
         for index, frame in enumerate(frames):
-            if jobs.is_cancel_requested(job_id):
-                _mark_cancelled(job_id)
-                return
+            _raise_if_cancelled(job_id)
             detection = detect_subtitle_mask(
                 frame,
                 rect,
@@ -107,6 +135,7 @@ def process_video(
                 feather_radius=int(options.get("feather_radius", 3)),
                 reference_mask=reference_mask,
             )
+            _raise_if_cancelled(job_id)
             reference_mask = detection.binary_mask if detection.mask_coverage >= 0.01 else reference_mask
             full_mask = mask_to_full_frame(detection.binary_mask, rect, frame.shape)
             masks.append(full_mask)
@@ -120,6 +149,7 @@ def process_video(
                     current_frame=index + 1,
                     total_frames=total,
                 )
+                sleep(0)
 
         if jobs.is_cancel_requested(job_id):
             _mark_cancelled(job_id)
@@ -135,6 +165,7 @@ def process_video(
             current_frame: int | None = None,
             total_frames: int | None = None,
         ) -> None:
+            _raise_if_cancelled(job_id)
             jobs.update_job(
                 job_id,
                 step=step,
@@ -143,19 +174,24 @@ def process_video(
                 current_frame=current_frame,
                 total_frames=total_frames,
             )
+            sleep(0)
 
-        result = repair_video(
-            input_path=original_path,
-            output_path=output_path,
-            frames=frames,
-            mask_sequence=masks,
-            fps=fps,
-            mode=mode,
-            keep_audio=keep_audio,
-            options=options,
-            work_dir=work_dir,
-            progress_callback=progress_callback,
-        )
+        try:
+            result = repair_video(
+                input_path=original_path,
+                output_path=output_path,
+                frames=frames,
+                mask_sequence=masks,
+                fps=fps,
+                mode=mode,
+                keep_audio=keep_audio,
+                options=options,
+                work_dir=work_dir,
+                progress_callback=progress_callback,
+            )
+        except JobCancelled:
+            _mark_cancelled(job_id)
+            return
 
         avg_coverage = sum(item.mask_coverage for item in detections) / max(1, len(detections))
         jobs.update_job(
@@ -169,6 +205,8 @@ def process_video(
             output_url=f"/api/download/{job_id}",
             engine=result.engine,
         )
+    except JobCancelled:
+        _mark_cancelled(job_id)
     except Exception as exc:
         jobs.update_job(
             job_id,
@@ -286,9 +324,33 @@ def read_frame_at_time(video_path: Path, time_seconds: float) -> np.ndarray:
 
 
 def _mark_cancelled(job_id: str) -> None:
+    try:
+        if jobs.get_job(job_id).get("status") == "failed":
+            return
+    except KeyError:
+        return
     jobs.update_job(
         job_id,
         status="cancelled",
         step="cancelled",
         message="任务已取消",
     )
+
+
+def _raise_if_cancelled(job_id: str) -> None:
+    if jobs.is_cancel_requested(job_id):
+        raise JobCancelled("任务已取消")
+
+
+def _performance_warning_from_metadata(metadata: dict | None) -> str | None:
+    if not metadata:
+        return None
+    warnings: list[str] = []
+    duration = float(metadata.get("duration") or 0)
+    width = int(metadata.get("width") or 0)
+    height = int(metadata.get("height") or 0)
+    if duration > 20:
+        warnings.append("Railway CPU 模式下，超过 20 秒的视频建议先裁剪后处理。")
+    if width > 1920 or height > 1080:
+        warnings.append("视频分辨率超过 1080p，处理可能很慢。")
+    return " ".join(warnings) if warnings else None
